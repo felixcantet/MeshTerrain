@@ -1,0 +1,18 @@
+{
+    "name": "com.fca.mesh-terrain.Runtime",
+    "rootNamespace": "Fca.MeshTerrain",
+    "references": [
+        "Unity.Burst",
+        "Unity.Collections",
+        "Unity.Mathematics"
+    ],
+    "includePlatforms": [
+        
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": true,
+    "overrideReferences": false,
+    "autoReferenced": true,
+    "versionDefines": [],
+    "defineConstraints": []
+}

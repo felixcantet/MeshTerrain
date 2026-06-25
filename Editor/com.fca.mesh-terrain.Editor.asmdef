@@ -1,0 +1,21 @@
+﻿{
+    "autoReferenced":  true,
+    "includePlatforms":  [
+                             "Editor"
+                         ],
+    "references":  [
+                       "com.fca.mesh-terrain.Runtime"
+                   ],
+    "overrideReferences":  false,
+    "allowUnsafeCode":  false,
+    "name":  "com.fca.mesh-terrain.Editor",
+    "excludePlatforms":  [
+
+                         ],
+    "versionDefines":  [
+
+                       ],
+    "defineConstraints":  [
+
+                          ]
+}

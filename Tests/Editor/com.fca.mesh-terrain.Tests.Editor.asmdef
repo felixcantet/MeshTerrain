@@ -1,0 +1,26 @@
+{
+    "name": "com.fca.mesh-terrain.Tests.Editor",
+    "rootNamespace": "Fca.MeshTerrain.Tests",
+    "references": [
+        "com.fca.mesh-terrain.Editor",
+        "com.fca.mesh-terrain.Runtime",
+        "Unity.Burst",
+        "Unity.Collections",
+        "Unity.Mathematics",
+        "UnityEngine.TestRunner",
+        "UnityEditor.TestRunner"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": true,
+    "overrideReferences": true,
+    "autoReferenced": true,
+    "precompiledReferences": [
+        "nunit.framework.dll"
+    ],
+    "defineConstraints": [
+        "UNITY_INCLUDE_TESTS"
+    ]
+}
