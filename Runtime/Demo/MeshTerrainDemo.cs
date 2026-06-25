@@ -22,6 +22,7 @@ namespace Fca.MeshTerrain.Demo
             Phase0_DisplayPlane,      // build a MeshData by hand -> display it
             Phase1_PartitionColored,  // partition a plane -> one colored GO per section
             Phase2_NoisePartition,    // modifier stack (Rectangle + Noise + paint) -> partition -> colored
+            Phase3_CompiledSections,  // modifier stack -> partition -> LOD/skirt/collision section compiler
         }
 
         [Header("What to build")]
@@ -42,11 +43,21 @@ namespace Fca.MeshTerrain.Demo
         public float paintRadius = 120f;
         public float paintFalloff = 60f;
 
+        [Header("Section Compilation (Phase 3)")]
+        public bool generateLODs = true;
+        public bool generateSkirts = true;
+        public bool generateCollision = true;
+        public float skirtWidth = 0f;       // 0 = cell-size default
+        public float skirtPushDown = 0f;    // 0 = cell-size default
+        public float[] lodQualities = { 1f, 0.5f, 0.25f };
+        public float[] lodTransitionHeights = { 0.6f, 0.3f, 0.1f };
+
         // Tracked so we can fully tear down between rebuilds. Meshes are tracked separately because
         // destroying a GameObject does NOT free the Mesh it referenced — that was the "old meshes still
         // in the scene" leak.
         readonly List<GameObject> _spawned = new();
         readonly List<Mesh> _meshes = new();
+        readonly List<CompiledSection> _compiledSections = new();
 
         void OnEnable() => RequestRebuild();
 
@@ -94,6 +105,7 @@ namespace Fca.MeshTerrain.Demo
                 case Mode.Phase0_DisplayPlane: BuildPhase0(); break;
                 case Mode.Phase1_PartitionColored: BuildPhase1(); break;
                 case Mode.Phase2_NoisePartition: BuildPhase2(); break;
+                case Mode.Phase3_CompiledSections: BuildPhase3(); break;
             }
         }
 
@@ -155,6 +167,61 @@ namespace Fca.MeshTerrain.Demo
             finally { built.Dispose(); }
         }
 
+
+        void BuildPhase3()
+        {
+            var rect = new RectangleBaseModifier
+            {
+                Resolution = new int2(resolution, resolution),
+                Size = new float2(size, size),
+            };
+            var noise = new NoiseModifier
+            {
+                UnscaledCoverage = new float3(size * 1.5f, 400f, size * 1.5f),
+                Intensity = noiseIntensity,
+                DisplacementType = NoiseType.Fbm,
+                NoiseFrequency = new double2(noiseFrequency, noiseFrequency),
+                Falloff = 0.1,
+            };
+            var paint = new WeightUtilityModifier
+            {
+                WeightChannelName = paintChannel,
+                Radius = paintRadius, Falloff = paintFalloff,
+                InnerValue = 1f, OuterValue = 0f,
+            };
+
+            var stack = new List<ModifierComponent> { rect, noise, paint };
+            var built = ModifierGroup.Process(stack, float4x4.identity, Allocator.TempJob);
+            try
+            {
+                var grid = new GridSettings { CellSize = cellSize, Is2D = true };
+                var result = MeshPartitioner.Partition(built.Mesh, grid, built.Weights, Allocator.TempJob);
+                try
+                {
+                    var settings = new SectionCompilationSettings
+                    {
+                        Material = material,
+                        GenerateLODs = generateLODs,
+                        GenerateCollision = generateCollision,
+                        LODQualities = lodQualities,
+                        LODScreenRelativeTransitionHeights = lodTransitionHeights,
+                        Skirt = MeshSkirtSettings.DefaultForCellSize(cellSize),
+                    };
+                    settings.Skirt.Enabled = generateSkirts;
+                    if (skirtWidth > 0f) settings.Skirt.Width = skirtWidth;
+                    if (skirtPushDown > 0f) settings.Skirt.PushDown = skirtPushDown;
+
+                    var compiled = SectionCompiler.Compile(result, settings, transform);
+                    for (int i = 0; i < compiled.Length; i++)
+                    {
+                        _compiledSections.Add(compiled[i]);
+                        ApplySectionColor(compiled[i], ColorFor(i));
+                    }
+                }
+                finally { result.Dispose(); }
+            }
+            finally { built.Dispose(); }
+        }
         // ---- helpers ----
 
         static MeshData MakePlane(int cells, float size, Allocator alloc)
@@ -206,8 +273,21 @@ namespace Fca.MeshTerrain.Demo
             return Color.HSVToRGB((i * 0.61803398875f) % 1f, 0.65f, 0.95f);
         }
 
+
+        static void ApplySectionColor(CompiledSection section, Color color)
+        {
+            if (section?.Root == null) return;
+            var mpb = new MaterialPropertyBlock();
+            mpb.SetColor("_BaseColor", color);
+            mpb.SetColor("_Color", color);
+            foreach (var renderer in section.Root.GetComponentsInChildren<MeshRenderer>())
+                renderer.SetPropertyBlock(mpb);
+        }
         void Clear()
         {
+            foreach (var compiled in _compiledSections) compiled.Dispose();
+            _compiledSections.Clear();
+
             // Destroy spawned GameObjects, plus any orphan children left after a domain reload (where
             // _spawned was cleared but the child GameObjects persisted).
             foreach (var go in _spawned) DestroyObject(go);
