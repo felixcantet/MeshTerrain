@@ -6,7 +6,7 @@ checklists as work lands.
 | Phase | Title | Status |
 |---|---|---|
 | 0 | Fondations & format de données | ✅ Done |
-| 1 | Partition spatiale | ⬜ Not started |
+| 1 | Partition spatiale | 🟡 In progress |
 | 2 | Modifier stack non-destructif | ⬜ Not started |
 | 3 | Compilation des sections (Mesh + LOD + collision) | ⬜ Not started |
 | 4 | Channels → texture atlas | ⬜ Not started |
@@ -52,16 +52,37 @@ Decisions / notes for later phases:
 
 ---
 
-## Phase 1 — Partition spatiale ⬜
+## Phase 1 — Partition spatiale 🟡
 
 **Objectif** : partitionner un grand mesh en sections sur une grille (bucket-sort Burst, cf. `06 §2`).
 
-- [ ] `GridSettings { uint CellSize; bool Is2D; float3 WorldOriginOffset; }`.
-- [ ] `ComputeGridDimensions` — anchor-shifted floor snap (cf. `02 §4.1`).
-- [ ] `BuildSections` Burst : assign triangles→cellule par centroïde, bucket-sort, build mesh par section.
-- [ ] Sous-découpe par complexité (`MaxSectionComplexity`).
+**En cours** (branche `phase-1-spatial-partition`). Grid + BuildSections livrés ; sous-découpe par
+complexité différée (pass suivant). Convention d'axe **Unity-native** : plan XZ, +Y up — `Is2D` collapse
+l'axe **Y** (≠ UE qui collapse Z). À re-mapper au portage du Noise modifier en Phase 2.
 
-**Réf** : `02 §4.1–4.2`, `06 §2`, `MeshPartitionMeshBuilder.cpp`, `MeshPartitionSubsectionTransformer.h`.
+- [x] `GridSettings { float CellSize; bool Is2D; float3 WorldOriginOffset; }` + `FromDefinition`
+      (`Runtime/Partition/GridSettings.cs`). `CellSize` cast depuis le `uint` de la Definition.
+- [x] `GridDimensions.ComputeGridDimensions` — anchor-shifted floor snap (cf. `02 §4.1`), helpers
+      `LinearIndex`/`LocalCoord`/`AbsoluteCoord`/`CellCenter` (`Runtime/Partition/GridDimensions.cs`).
+- [x] `BuildSections` Burst (`Runtime/Partition/PartitionJobs.cs` + `MeshPartitioner.cs`) : assign
+      triangles→cellule par centroïde (`AssignTrianglesToCellsJob`), bucket-sort prefix-sum + scatter
+      (`BucketTrianglesJob`), comptage vertices par section (`CountSectionVerticesJob`), build mesh +
+      transfert d'attributs par section (`BuildSectionMeshJob`, un `IJob` par section combinés).
+      Sortie : `PartitionResult` (sections + clés de cellule absolues + side-car weight-layers).
+- [ ] Sous-découpe par complexité (`MaxSectionComplexity`) — **différée**.
+
+**Réf** : `02 §4.1–4.2`, `06 §2 & §5`, `MeshPartitionMeshBuilder.cpp`, `MeshPartitionSubsectionTransformer.h`.
+
+Décisions / notes :
+- Pas de clipping : assignation par centroïde → bords en dents de scie (masqués par les skirts en Phase 3).
+- Bucket déterministe sans atomique (le centroïde tombe dans une seule cellule ; pas de CAS comme UE).
+- `MeshData` reste fixe (pas d'append) : les counts par section sont calculés avant allocation. Le builder
+  topologique reste différé à la Phase 2 (seul le chemin DynamicSubmesh en a besoin).
+- Job System intégré au moteur en Unity 6 (`6000.3`) : aucune référence asmdef `Unity.Jobs` requise.
+- Stabilité du cache : pour une ancre **fixe**, la coordonnée absolue d'un point monde ne dépend pas des
+  bounds du mesh passées (≠ ancrer sur les bounds). Changer l'ancre re-numérote volontairement `OriginCoord`.
+- Tests : `Tests/Runtime/PartitionTests.cs` (dims, indépendance coords/bounds, conservation des triangles,
+  remap, transfert d'attributs + weight-layers, cas mono-cellule, smoke test ~500k tris).
 
 ---
 
