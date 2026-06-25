@@ -7,7 +7,7 @@ checklists as work lands.
 |---|---|---|
 | 0 | Fondations & format de données | ✅ Done |
 | 1 | Partition spatiale | 🟡 In progress |
-| 2 | Modifier stack non-destructif | ⬜ Not started |
+| 2 | Modifier stack non-destructif | 🟡 In progress |
 | 3 | Compilation des sections (Mesh + LOD + collision) | ⬜ Not started |
 | 4 | Channels → texture atlas | ⬜ Not started |
 | 5 | Streaming & build incrémental | ⬜ Not started |
@@ -86,12 +86,38 @@ Décisions / notes :
 
 ---
 
-## Phase 2 — Modifier stack non-destructif ⬜
+## Phase 2 — Modifier stack non-destructif 🟡
 
-- [ ] `MeshView` (vue bornée read/write).
-- [ ] `IModifierJob` / `ModifierComponent` abstract.
-- [ ] Pipeline `ProcessModifierGroup` (tri par priorité).
-- [ ] Modifiers : Noise, WeightUtility, Rectangle/HeightmapImporter.
+**En cours** (branche `phase-2-modifier-stack`). Chemin simple (VertexPos + Weight + UV) ; pas de
+`DynamicSubmesh` (topologie) ce pass — il exige le builder/append de `MeshData` toujours différé. Pipeline
+= modifiers d'abord, puis partition (ordre UE) ; managé d'abord (Burst plus tard).
+
+- [x] `MeshView` (vue bornée read/write, masque de composants) — `Runtime/Modifiers/MeshView.cs`,
+      `MeshViewComponents.cs` (enum `[Flags]` + `InstanceInfo`). Collecte les vertices dans les bounds,
+      cache pos/UV/poids par index de vue, writeback par vertex id. Rejette les écritures non déclarées /
+      hors bounds.
+- [x] `IModifierJob` / `ModifierComponent` abstract — `Runtime/Modifiers/IModifierJob.cs`,
+      `ModifierComponent.cs` (Bounds, PriorityLayer, SubPriority, Complexity, IsBase, IsDisabled,
+      ProduceBaseMesh / CreateJob).
+- [x] Pipeline `ProcessModifierGroup` — `Runtime/Modifiers/ModifierGroup.cs` : tri `(PriorityLayer,
+      SubPriority)`, le base modifier produit la géométrie (recompilation fraîche → non-destructif), chaque
+      modifier suivant s'applique via un `MeshView` borné. Sortie `ModifierResult` (mesh + weight-layers)
+      → prête pour `MeshPartitioner.Partition`.
+- [x] Modifiers : **Noise** (`Noise/NoiseModifier.cs` + `FbmNoise.cs` — FBM Standard/Turbulent/Ridge sur
+      `noise.snoise`, + sine, falloff smoothstep, écriture optionnelle de channel), **WeightUtility**
+      (`WeightUtilityModifier.cs` — peinture radiale inner/outer, chemin simple sans cosine/submesh),
+      **Rectangle base** (`RectangleBaseModifier.cs` — grille régulière, hook `HeightFn` pour le futur
+      HeightmapImporter). HeightmapImporter lui-même différé.
+
+Décisions / notes :
+- **Espaces de coordonnées (piège n°1)** reproduits fidèlement : mesh-local → monde → patch-local,
+  déplacement le long du Y patch ("up"), retour patch → monde → mesh-local. Convention Unity : plan XZ,
+  +Y up — un patch Noise par défaut déplace un plan plat le long du **Y monde** (≠ UE qui déplace en Z patch).
+- **Non-destructif** : chaque `Process` rebuild un `MeshData` neuf depuis le base ; désactiver un modifier
+  et relancer reproduit exactement le résultat du bas de pile (testé).
+- Tests : `Tests/Runtime/ModifierTests.cs` (topologie base, bornes/masques MeshView, peinture
+  inner/outer, axe Y du Noise, écriture de channel, ordre de priorité, recompilation non-destructive,
+  bout-en-bout stack → partition).
 
 ---
 
