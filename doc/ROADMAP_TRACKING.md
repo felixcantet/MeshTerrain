@@ -8,7 +8,7 @@ checklists as work lands.
 | 0 | Fondations & format de données | ✅ Done |
 | 1 | Partition spatiale | 🟡 In progress |
 | 2 | Modifier stack non-destructif | 🟡 In progress |
-| 3 | Compilation des sections (Mesh + LOD + collision) | ⬜ Not started |
+| 3 | Compilation des sections (Mesh + LOD + collision) | ✅ Done |
 | 4 | Channels → texture atlas | ⬜ Not started |
 | 5 | Streaming & build incrémental | ⬜ Not started |
 | 6 | Modifiers avancés & outils interactifs (optionnel) | ⬜ Not started |
@@ -121,12 +121,20 @@ Décisions / notes :
 
 ---
 
-## Phase 3 — Compilation des sections ⬜
+## Phase 3 — Compilation des sections ✅
 
-- [ ] Section → `Mesh` + GameObject.
-- [ ] LODs (simplification quadric) + `LODGroup`.
-- [ ] Skirt anti-crack.
-- [ ] Collision par section.
+**Done** (2026-06-25). Acceptance met after human Unity validation: sections display with working LODs, skirts close visible cracks, and per-section collision is assigned.
+
+- [x] Section → `Mesh` + GameObject via `Runtime/Sections/SectionCompiler.cs` (`MeshFilter`/`MeshRenderer` children, root positioned from `GridDimensions` + stable `SectionCoords`).
+- [x] LODs + `LODGroup` using vendored MIT `UnityMeshSimplifier` v3.1.1 under `Runtime/ThirdParty/UnityMeshSimplifier`; default chain `1.0 / 0.5 / 0.25`.
+- [x] Skirt anti-crack generated into fresh `MeshData` + fresh `WeightLayerSet`, preserving UVs/normals/base IDs/weights.
+- [x] Collision par section via `MeshCollider`, built from original unskirted/unsimplified section mesh.
+- [x] Human EditMode suite + visual demo confirmation before marking Done.
+
+Décisions / notes :
+- No external package registry dependency; simplifier source is vendored with MIT license/notice.
+- Weight layers are packed into UV2-UV7 as `Vector4` groups (max 24 layers) before simplification so LOD meshes keep material-channel signals.
+- Collision intentionally ignores skirts and simplification to avoid vertical edge walls and preserve authored terrain contact.
 
 ---
 
