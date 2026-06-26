@@ -7,6 +7,13 @@ l'apprentissage du système (data + partition d'abord) avant la complexité (mod
 > **Jobs** (`IJobParallelFor`), **Mathematics**, optionnellement **Entities Graphics**/**Addressables** pour le
 > streaming. URP ou HDRP au choix (le pipeline channel/atlas est agnostique).
 
+> **Convention de portage depuis `02_SYSTEM_ANALYSIS.md`** : le code UE analysé est en mode terrain XY/Z-up
+> (`bIs2D` collapse Z, Noise déplace en Z patch). Le port Unity choisit une convention native XZ/+Y :
+> `Is2D` collapse Y, les UV/paramètres terrain utilisent XZ, et les modifiers déplacent le long du Y patch.
+> Toutes les décisions ci-dessous doivent préserver les invariants de `02` (géométrie 3D pure, assignation par
+> centroïde, coordonnées de cellules stables, stack non-destructif, channels par-vertex puis atlas), en remappant
+> seulement les axes.
+
 ---
 
 ## Phase 0 — Fondations & format de données
@@ -19,7 +26,8 @@ l'apprentissage du système (data + partition d'abord) avant la complexité (mod
 - [ ] Conversion `MeshData → UnityEngine.Mesh` (set vertices/triangles/normals/uv + un UV channel pour l'atlas).
 - [ ] Conversion `MeshData → Mesh` pour collision (`MeshCollider.sharedMesh`).
 - [ ] (Option) une struct `ScriptableObject` `MeshPartitionDefinition` : material, liste de channels (noms),
-      `CellSize`, `bIs2D`, `MaxSectionComplexity`, `ChannelTexelSize`.
+      `CellSize` (`0 = no split` / mono-section), `Is2D` (Unity : collapse Y), `MaxSectionComplexity`,
+      `ChannelTexelSize`.
 
 **Done quand** : tu peux créer un `MeshData` en code, le convertir en `Mesh` Unity et l'afficher.
 **Réf source** : `MeshPartitionMeshData.h`, `MeshPartitionDefinition.h`, `MeshPartitionChannel.h`.
@@ -30,8 +38,11 @@ l'apprentissage du système (data + partition d'abord) avant la complexité (mod
 
 **Objectif** : partitionner un grand mesh en sections sur une grille. **C'est la brique la plus fondamentale.**
 
-- [ ] `GridSettings { int CellSize; bool Is2D; float3 WorldOriginOffset; }`.
-- [ ] `ComputeGridDimensions(bounds, grid)` : anchor-shifted floor snap (cf. `02 §4.1`).
+- [ ] `GridSettings { float CellSize; bool Is2D; float3 WorldOriginOffset; }`
+      (`CellSize <= 0` = mono-section, équivalent UE `CellSize = 0`).
+- [ ] `ComputeGridDimensions(bounds, grid, meshToWorld)` : anchor-shifted floor snap (cf. `02 §4.1`).
+      En Unity, `Is2D` collapse Y (et non Z) ; l'ancre doit rester en espace monde/local cohérent avec le
+      transform du mesh pour que les coordonnées de cellule restent stables.
 - [ ] `BuildSections(meshData, gridDims)` — **version Burst recommandée** :
       1. `IJobParallelFor` : pour chaque triangle, calcule `cellIndex = floor((centroid - anchor)/cell)` →
          `NativeArray<int> triangleCell`.
@@ -52,12 +63,14 @@ l'apprentissage du système (data + partition d'abord) avant la complexité (mod
 **Objectif** : reproduire le système de modifiers bornés rejouables.
 
 - [ ] `MeshView` : vue bornée sur le `MeshData` avec masque read/write (`enum MeshViewComponents { VertexPos,
-      Submesh, Weight, UV }`). Au minimum : itération sur les vertices d'une zone + get/set position + get/set weight.
+      DynamicSubmesh, Weight, UV }`). Au minimum : itération sur les vertices d'une zone + get/set position +
+      get/set weight ; `DynamicSubmesh` peut rester différé tant que les modifiers topologiques le sont.
 - [ ] `IModifierJob` / `ModifierComponent` (abstract) : `Bounds`, `PriorityLayer`, `SubPriority`, `Complexity`,
       `GetInstancesInBounds()`, `ApplyModifications(MeshView, transform, instance)`.
 - [ ] Pipeline `ProcessModifierGroup` : trie par `(priorityLayer, subPriority)`, applique en séquence ; base
       modifier produit la géométrie.
-- [ ] **Premier modifier concret : Noise** (cf. `02 §5.2`, port direct de `MeshPartitionNoiseModifier.cpp`).
+- [ ] **Premier modifier concret : Noise** (cf. `02 §5.2`, port direct de `MeshPartitionNoiseModifier.cpp`,
+      avec remap Unity XZ/+Y et tests non-identity `meshToWorld`/patch transform avant intégration scène).
 - [ ] **Deuxième : WeightUtility** (peinture de channel) et **Rectangle/HeightmapImporter** (base modifier).
 
 **Done quand** : un base modifier (heightmap) + un Noise + une peinture de channel produisent un `MeshData`
@@ -72,8 +85,10 @@ modifié, et désactiver un modifier ré-applique proprement la pile (non-destru
 **Objectif** : transformer chaque section en asset rendu/collisionnable.
 
 - [ ] `Section → UnityEngine.Mesh` + GameObject (`MeshRenderer`/`MeshFilter`).
-- [ ] **LODs par simplification quadric** : intégrer `UnityMeshSimplifier` (Whinarn) ou porter l'algo quadric
-      attribute-aware. Alimenter un `LODGroup`. (Remplace Nanite — cf. `04`.)
+- [ ] **LODs par simplification quadric** : intégrer `UnityMeshSimplifier` (Whinarn) pour un premier chemin ou
+      porter l'algo quadric attribute-aware. Alimenter un `LODGroup`. (Remplace Nanite — cf. `04`.)
+      Attention : la parité avec `02 §7` exige de préserver normals/UV/weight-layers ; si le simplifier n'est
+      pas attribute-aware, les weights doivent au minimum être packés/testés à travers les UVs de LOD.
 - [ ] **Skirt** anti-crack : bandeau vertical au périmètre de section.
 - [ ] Collision : `MeshCollider` par section (avec, à terme, le physical material du channel dominant).
 
@@ -86,11 +101,14 @@ modifié, et désactiver un modifier ré-applique proprement la pile (non-destru
 
 **Objectif** : rastériser les weight-layers en texture pour le shading.
 
-- [ ] Générer les `ChannelUVs` (dépliage atlas par section — commence par un simple box/plane project).
-- [ ] **Compute Shader** : rastérise les poids par-vertex dans une `RenderTexture` via le domaine UV
-      (cf. `06 §3`). Au début : version CPU/Burst acceptable pour petites résolutions.
-- [ ] Pull-push gutter fill (Compute) pour éviter le bleeding. *(Optionnel d'abord.)*
-- [ ] Shader de terrain qui échantillonne l'atlas + la table de packing des channels (Custom data / MaterialPropertyBlock).
+- [x] Générer les `ChannelUVs` (dépliage atlas par section — box/triangle-normal project).
+- [x] **Compute Shader** : rastérise les poids par-vertex dans une `RenderTexture` via le domaine UV
+      (cf. `06 §3`) **et** une version CPU/Burst. Backend sélectionnable ; le GPU garde un
+      `RenderTexture` array vivant (pas de readback) et retombe sur le CPU si compute non supporté.
+- [x] Pull-push gutter fill (CPU + Compute) pour éviter le bleeding.
+- [x] Shader de terrain (prototype URP) qui échantillonne l'atlas + la table de packing des channels
+      (`FChannelPacking` : 24 channels, transport slot→texture-slice via `MaterialPropertyBlock`).
+      Les weights packés en UV2-UV7 pour les LODs restent un transport intermédiaire, pas le rendu final.
 
 **Done quand** : la peinture de channels (Phase 2) se voit comme un blend de matériaux à l'écran.
 **Réf source** : `Shaders/MeshPartitionMakeSectionChannels.usf`, `Shaders/MeshPartitionBorderFill.usf`,
@@ -151,6 +169,6 @@ modifié, et désactiver un modifier ré-applique proprement la pile (non-destru
 3. **Stabilité des coordonnées de cellule** (anchor-shifted snap) : indispensable pour le cache incrémental ;
    ne pas ancrer sur les bounds du mesh. (Phase 1 & 5.)
 4. **Espaces de coordonnées** dans les modifiers (mesh-local ↔ world ↔ patch-local) : source d'erreurs n°1.
-   Reproduire fidèlement les transformations du Noise modifier. (Phase 2.)
+   Reproduire fidèlement les transformations du Noise modifier, avec le remap Unity XZ/+Y documenté plus haut. (Phase 2.)
 5. **Non-destructif = recompilation** : ne jamais muter la géométrie source en place de façon irréversible ;
    toujours repartir des base modifiers + rejouer la pile. (Phase 2.)

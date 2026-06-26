@@ -134,11 +134,12 @@ namespace Fca.MeshTerrain.Tests
             {
                 raster = ChannelRasterizerCPU.Render(channelized, cWeights, mapping, enableGutterFill: true);
                 Assert.IsNotNull(raster.Texture);
-                Assert.AreEqual(1, raster.Texture.depth);
+                var tex = (Texture2DArray)raster.Texture;
+                Assert.AreEqual(1, tex.depth);
 
                 // A texel inside the covered region should read ~1.0; pick the atlas center.
-                var px = raster.Texture.GetPixels(0);
-                int res = raster.Texture.width;
+                var px = tex.GetPixels(0);
+                int res = tex.width;
                 float center = px[(res / 2) * res + res / 2].r;
                 float maxVal = 0f;
                 foreach (var p in px) maxVal = math.max(maxVal, p.r);
@@ -164,8 +165,8 @@ namespace Fca.MeshTerrain.Tests
                 filled = ChannelRasterizerCPU.Render(channelized, cWeights, mapping, enableGutterFill: true);
                 unfilled = ChannelRasterizerCPU.Render(channelized, cWeights, mapping, enableGutterFill: false);
 
-                int zerosFilled = CountZeros(filled.Texture.GetPixels(0));
-                int zerosUnfilled = CountZeros(unfilled.Texture.GetPixels(0));
+                int zerosFilled = CountZeros(((Texture2DArray)filled.Texture).GetPixels(0));
+                int zerosUnfilled = CountZeros(((Texture2DArray)unfilled.Texture).GetPixels(0));
                 Assert.LessOrEqual(zerosFilled, zerosUnfilled,
                     "gutter fill should not increase the number of empty texels");
             }

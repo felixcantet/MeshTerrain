@@ -1,0 +1,68 @@
+// Border fill (Phase 4b GPU backend). Direct port of UE MeshPartitionBorderFill.usf MainCS:
+// each uncovered texel takes the average of the nearest covered texels within a kernel-3 radius,
+// seeding the gutter so pull-push has something to grow from. Operates on one channel slice.
+//
+// Writes the updated coverage into a SEPARATE mask (_RWMaskOut): covered texels stay 1, newly
+// filled texels become 1. The CPU path propagates this updated mask into pull-push so it does not
+// over-fill; the GPU must do the same to match (reading/writing the input mask in place would race).
+#pragma kernel BorderFill
+
+uint2 _Resolution;
+Texture2D<float>    _Mask;        // original coverage (read-only)
+RWTexture2D<float>  _RWSignal;    // single-channel weight image (mutated in place)
+RWTexture2D<float>  _RWMaskOut;   // updated coverage (distinct target)
+
+int Square(int v) { return v * v; }
+
+[numthreads(8, 8, 1)]
+void BorderFill(uint2 id : SV_DispatchThreadID)
+{
+    if (any(id >= _Resolution))
+        return;
+
+    if (_Mask[id] > 0.5)
+    {
+        _RWMaskOut[id] = 1.0; // already covered: keep signal, mark covered
+        return;
+    }
+
+    int2 texPos = int2(id);
+    const int kernel = 3;
+    int2 lo = max(texPos - kernel, int2(0, 0));
+    int2 hi = min(texPos + kernel, int2(_Resolution) - 1);
+
+    int bestDistSqr = Square(kernel + 1);
+    float candidate = 0.0;
+    int samples = 0;
+
+    for (int y = lo.y; y <= hi.y; ++y)
+    {
+        for (int x = lo.x; x <= hi.x; ++x)
+        {
+            int d = Square(x - texPos.x) + Square(y - texPos.y);
+            if (d > bestDistSqr) continue;
+
+            uint2 o = uint2(x, y);
+            if (_Mask[o] < 0.5) continue;
+
+            if (d < bestDistSqr)
+            {
+                bestDistSqr = d;
+                samples = 0;
+                candidate = 0;
+            }
+            candidate += _RWSignal[o];
+            samples++;
+        }
+    }
+
+    if (samples > 0)
+    {
+        _RWSignal[id] = candidate / float(samples);
+        _RWMaskOut[id] = 1.0;
+    }
+    else
+    {
+        _RWMaskOut[id] = 0.0;
+    }
+}

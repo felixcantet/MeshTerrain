@@ -1,7 +1,10 @@
 # Roadmap Progress Tracking
 
 Tracks implementation progress against [`05_UNITY_ROADMAP.md`](05_UNITY_ROADMAP.md). Update the status and the
-checklists as work lands.
+checklists as work lands. The roadmap mirrors [`02_SYSTEM_ANALYSIS.md`](02_SYSTEM_ANALYSIS.md), with one global
+porting convention: Unreal terrain is XY/Z-up (`bIs2D` collapses Z), while this Unity port is XZ/+Y (`Is2D`
+collapses Y). Any implementation notes that depart from `02` should say whether the difference is an intentional
+axis remap, a first-pass simplification, or deferred work.
 
 | Phase | Title | Status |
 |---|---|---|
@@ -9,7 +12,7 @@ checklists as work lands.
 | 1 | Partition spatiale | 🟡 In progress |
 | 2 | Modifier stack non-destructif | 🟡 In progress |
 | 3 | Compilation des sections (Mesh + LOD + collision) | ✅ Done |
-| 4 | Channels → texture atlas | ⬜ Not started |
+| 4 | Channels → texture atlas | ✅ Done |
 | 5 | Streaming & build incrémental | ⬜ Not started |
 | 6 | Modifiers avancés & outils interactifs (optionnel) | ⬜ Not started |
 
@@ -81,6 +84,8 @@ Décisions / notes :
 - Job System intégré au moteur en Unity 6 (`6000.3`) : aucune référence asmdef `Unity.Jobs` requise.
 - Stabilité du cache : pour une ancre **fixe**, la coordonnée absolue d'un point monde ne dépend pas des
   bounds du mesh passées (≠ ancrer sur les bounds). Changer l'ancre re-numérote volontairement `OriginCoord`.
+- Cohérence avec `02 §2.4` : `CellSize = 0` doit signifier mono-section. La doc principale le rappelle ; le code
+  actuel doit encore ajouter le guard `CellSize <= 0` avant d'être complet sur ce point.
 - Tests : `Tests/Runtime/PartitionTests.cs` (dims, indépendance coords/bounds, conservation des triangles,
   remap, transfert d'attributs + weight-layers, cas mono-cellule, smoke test ~500k tris).
 
@@ -110,9 +115,10 @@ Décisions / notes :
       HeightmapImporter). HeightmapImporter lui-même différé.
 
 Décisions / notes :
-- **Espaces de coordonnées (piège n°1)** reproduits fidèlement : mesh-local → monde → patch-local,
-  déplacement le long du Y patch ("up"), retour patch → monde → mesh-local. Convention Unity : plan XZ,
-  +Y up — un patch Noise par défaut déplace un plan plat le long du **Y monde** (≠ UE qui déplace en Z patch).
+- **Espaces de coordonnées (piège n°1)** : l'invariant de `02 §5.2` reste mesh-local ↔ world ↔ patch-local.
+  Le chemin actuel teste surtout le noyau Unity XZ/+Y avec `meshToWorld = identity` et un `PatchTransform`
+  exprimé en mesh-local ; avant l'intégration scène/MonoBehaviour, ajouter des tests non-identity `meshToWorld`
+  et clarifier si le patch transform est stocké en world ou mesh-local.
 - **Non-destructif** : chaque `Process` rebuild un `MeshData` neuf depuis le base ; désactiver un modifier
   et relancer reproduit exactement le résultat du bas de pile (testé).
 - Tests : `Tests/Runtime/ModifierTests.cs` (topologie base, bornes/masques MeshView, peinture
@@ -134,16 +140,49 @@ Décisions / notes :
 Décisions / notes :
 - No external package registry dependency; simplifier source is vendored with MIT license/notice.
 - Weight layers are packed into UV2-UV7 as `Vector4` groups (max 24 layers) before simplification so LOD meshes keep material-channel signals.
+  This is a Phase 3 transport for LOD simplification, not the final `FChannelPacking`/channel-atlas material path from `02 §2.2` and `§6`.
 - Collision intentionally ignores skirts and simplification to avoid vertical edge walls and preserve authored terrain contact.
 
 ---
 
-## Phase 4 — Channels → texture atlas ⬜
+## Phase 4 — Channels → texture atlas ✅
 
-- [ ] Génération des `ChannelUVs`.
-- [ ] Rastérisation des poids (Compute ou CPU/Burst).
-- [ ] Pull-push gutter fill (optionnel).
-- [ ] Shader terrain échantillonnant l'atlas.
+**Done** (2026-06-26), livré en deux sous-PR : 4a (CPU) puis 4b (Compute). Acceptance : la
+peinture de channels (Phase 2) se voit comme un blend de matériau à l'écran (validé humainement
+en URP).
+
+- [x] Génération des `ChannelUVs` — box/triangle-normal project (`Runtime/Channels/ChannelUVUnwrap.cs`,
+      port simplifié de `ReferenceBoxProject`). Tris assignés à la face de boîte de l'axe dominant,
+      vertices dupliqués aux coutures de face, 6 îlots shelf-packés en `[0,1]²` avec gouttière.
+      Produit `SectionDomainMapping` (résolution = `sqrt(Area3D/AreaUV)/TexelSize3D`, clampée, multiple de 4).
+- [x] Rastérisation des poids — **CPU/Burst** (`ChannelRasterizerCPU.cs`, raster barycentrique →
+      `Texture2DArray` R par couche + masque) **et Compute** (`ChannelRasterizerGPU.cs` +
+      `Runtime/Resources/MeshTerrain/ChannelRaster.shader` : VS mappe `ChannelUV → NDC`, MRT
+      poids+masque). Backend sélectionnable via `ChannelRasterizerBackend` ; le GPU garde un
+      `RenderTexture` array vivant (pas de readback) et retombe sur le CPU si compute non supporté.
+- [x] Border fill (kernel-3) + pull-push gutter fill — CPU (pyramide de mips) et Compute
+      (`ChannelBorderFill.compute`, `ChannelPullPush.compute`, ports directs des kernels UE).
+- [x] Shader terrain (prototype URP `MeshTerrainChannel.shader`) échantillonnant l'atlas + table de
+      packing. `FChannelPacking` complet (24 channels, 4×uint32, 6 slots/mot, 5 bits/slot) comme
+      stockage canonique ; transport par-renderer en `float[]` d'indices de slice via
+      `MaterialPropertyBlock` (les mots packés réinterprétés en float donnent des NaN/Inf qui ne
+      survivent pas au pipeline float matériau/GPU). Uniforms pilotés par MPB hors du CBUFFER
+      `UnityPerMaterial` (sinon le SRP Batcher ignore l'override par-section).
+
+Décisions / notes :
+- Un shader de terrain « state of the art » est prévu plus tard ; celui-ci ne sert qu'à visualiser
+  le blend de channels pour le prototypage.
+- Tests : `Tests/Runtime/ChannelTests.cs` (EditMode : packing, UV, résolution, raster CPU, gutter,
+  intégration compiler) + `ChannelGpuTests.cs` (GPU-vs-CPU et gouttières, ignorés si compute non
+  supporté).
+
+**Limitation connue (différée au shader de prod)** : les **coutures entre sections** sont visibles
+(léger quadrillage). Chaque section a son propre atlas dimensionné par `SectionDomainMapping`
+(densité de texel ≠ d'une section à l'autre) et est déplié indépendamment → la valeur échantillonnée
+à la frontière ne correspond pas exactement chez le voisin. Le prototype échantillonne l'UV0 brut et
+**ignore `TexcoordMetrics`/`Size3D`** ; un shader de prod doit l'utiliser pour une densité cohérente
+(et éventuellement une dilatation de gouttière inter-sections). À traiter avec la passe « shader
+state of the art », pas en Phase 4.
 
 ---
 

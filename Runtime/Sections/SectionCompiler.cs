@@ -193,10 +193,15 @@ namespace Fca.MeshTerrain
                     baseRenderSection = channelSection;
                     baseRenderWeights = channelWeights;
 
-                    if (settings.ChannelRasterizer != ChannelRasterizerBackend.CPU)
-                        Debug.LogWarning("Compute channel rasterizer is not available yet (Phase 4b); using CPU backend.");
+                    if (settings.ChannelRasterizer == ChannelRasterizerBackend.Compute)
+                    {
+                        raster = ChannelRasterizerGPU.Render(
+                            channelSection, channelWeights, mapping, settings.ChannelGutterFill);
+                        if (raster == null)
+                            Debug.LogWarning("Compute channel rasterizer unavailable (no compute support); using CPU backend.");
+                    }
 
-                    raster = ChannelRasterizerCPU.Render(
+                    raster ??= ChannelRasterizerCPU.Render(
                         channelSection, channelWeights, mapping, settings.ChannelGutterFill);
                     compiled.ChannelTexture = raster.Texture;
                 }
