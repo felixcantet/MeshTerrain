@@ -9,6 +9,9 @@ Shader "Mesh Terrain/Instanced Flat (URP, BRG)"
         _BaseColor  ("Base Color", Color) = (0.45, 0.50, 0.40, 1)
         _Smoothness ("Smoothness", Range(0,1)) = 0.1
         _Metallic   ("Metallic", Range(0,1)) = 0.0
+        // Per-instance LOD debug tint (written by the BRG presenter). Declared so the property exists on
+        // the material for DOTS instancing; default disables the tint (w=0).
+        _LodColor   ("LOD Debug Color", Vector) = (1, 1, 1, 0)
     }
 
     SubShader
@@ -42,6 +45,7 @@ Shader "Mesh Terrain/Instanced Flat (URP, BRG)"
                 float4 _BaseColor;
                 float  _Smoothness;
                 float  _Metallic;
+                float4 _LodColor;     // debug tint (per-material; the presenter uses a material per LOD band)
             CBUFFER_END
 
             struct Attributes
@@ -84,8 +88,11 @@ Shader "Mesh Terrain/Instanced Flat (URP, BRG)"
                 lightingInput.shadowCoord = TransformWorldToShadowCoord(IN.positionWS);
                 lightingInput.bakedGI = max(SampleSH(lightingInput.normalWS), 0.15);
 
+                // LOD debug tint: lerp the base toward the per-instance LOD color when enabled (w>0).
+                float3 albedo = lerp(_BaseColor.rgb, _LodColor.rgb, saturate(_LodColor.w) * 0.7);
+
                 SurfaceData surface = (SurfaceData)0;
-                surface.albedo = _BaseColor.rgb;
+                surface.albedo = albedo;
                 surface.metallic = _Metallic;
                 surface.smoothness = _Smoothness;
                 surface.occlusion = 1.0;

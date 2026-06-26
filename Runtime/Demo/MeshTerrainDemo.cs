@@ -91,6 +91,9 @@ namespace Fca.MeshTerrain.Demo
         public PresenterBackend presenterBackend = PresenterBackend.GameObject;
         [Tooltip("Flat instanced material for the BRG backend (uses 'Mesh Terrain/Instanced Flat' if unset).")]
         public Material instancedMaterial;
+        [Tooltip("BRG backend: tint each tile by its selected LOD (green=LOD0, yellow=LOD1, red=LOD2+) so " +
+                 "LOD selection is visible (BRG draws don't show in Scene wireframe).")]
+        public bool debugLodColors = true;
 
         // Tracked so we can fully tear down between rebuilds. Meshes are tracked separately because
         // destroying a GameObject does NOT free the Mesh it referenced — that was the "old meshes still
@@ -370,7 +373,9 @@ namespace Fca.MeshTerrain.Demo
 
             if (presenterBackend == PresenterBackend.BatchRendererGroup)
             {
-                _brgPresenter = new Fca.MeshTerrain.Streaming.BatchRendererGroupSectionPresenter(instancedMaterial);
+                _brgPresenter = new Fca.MeshTerrain.Streaming.BatchRendererGroupSectionPresenter(
+                    instancedMaterial, transform, lodTransitionHeights);
+                _brgPresenter.DebugLodColors = debugLodColors;
                 _streamer.SetPresenter(_brgPresenter);
             }
             else

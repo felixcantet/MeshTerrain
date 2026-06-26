@@ -24,14 +24,19 @@ namespace Fca.MeshTerrain.Streaming
     public sealed class BatchRendererGroupSectionPresenter : ISectionPresenter, IDisposable
     {
         // Per-instance data laid out for SRP DOTS instancing. The buffer is a Raw (float) buffer:
-        //   [ 16-float zeroed header ][ ObjectToWorld region: 12 floats * capacity ][ WorldToObject region ]
-        // Each matrix is a packed float3x4 (12 floats). Metadata offsets below are in BYTES.
+        //   [ 16f header ][ ObjectToWorld: 12f*cap ][ WorldToObject: 12f*cap ]
+        // Each matrix is a packed float3x4 (12 floats). All instances are identity (terrain geometry is in
+        // world space). Metadata offsets below are in BYTES.
         const int HeaderFloats = 16;                 // 64-byte reserved header (instance 0)
         const int FloatsPerMatrix = 12;              // float3x4
 
         readonly BatchRendererGroup _brg;
-        readonly Material _material;
+        readonly Material _material;                  // base (untinted) material
         readonly BatchMaterialID _materialId;
+        // One tinted material variant per LOD band for the LOD-debug view (avoids per-instance shader props /
+        // fragile DOTS macros): the draw command's materialID selects the LOD color. Falls back to _materialId.
+        BatchMaterialID[] _lodMaterialIds;
+        Material[] _lodMaterials;
 
         // One batch over a growable instance buffer; meshes are registered per section.
         GraphicsBuffer _instanceBuffer;
@@ -43,25 +48,56 @@ namespace Fca.MeshTerrain.Streaming
         {
             public int3 Coord { get; set; }
             public int Index;            // instance index in the buffer (>=1; 0 is reserved)
-            public Mesh Mesh;            // owned LOD0 mesh
-            public BatchMeshID MeshId;
+            public Mesh[] LodMeshes;     // owned, LOD0 first
+            public BatchMeshID[] LodIds;
             public float4x4 ObjectToWorld;
             public Bounds WorldBounds;
+            public float3 Center;        // world center, for LOD distance
+            public float Radius;         // world bounding radius, for screen-size LOD + cull
         }
+
+        /// <summary>Draw each section with a per-LOD tinted material (LOD0 green → coarse red) so LOD
+        /// selection is visible without wireframe (BRG draws don't show in Scene wireframe). Off = base material.</summary>
+        public bool DebugLodColors = true;
 
         readonly Dictionary<int3, Slot> _slots = new();
         readonly List<Slot> _live = new();              // dense list for draw emission
         readonly Transform _root;                        // parent for bookkeeping only (no per-section GO)
 
-        public BatchRendererGroupSectionPresenter(Material material, Transform root = null)
+        // LOD switch distances in multiples of a section's bounding radius (LOD0 nearest). A section uses
+        // LOD i once camera distance exceeds _lodDistanceFactors[i-1] * radius. Distance-based (not FOV) so it
+        // doesn't depend on uncertain LODParameters fields and is predictable for uniform terrain tiles.
+        float[] _lodDistanceFactors = { 4f, 10f };
+
+        public BatchRendererGroupSectionPresenter(Material material, Transform root = null, float[] lodTransitionHeights = null)
         {
             _material = material != null ? material : new Material(Shader.Find("Mesh Terrain/Instanced Flat (URP, BRG)"));
             _root = root;
+            // Map LODGroup-style screen heights (high→low) to distance factors (near→far): a smaller screen
+            // height means the LOD kicks in further away. Rough inverse mapping keeps demo parity.
+            if (lodTransitionHeights != null && lodTransitionHeights.Length > 0)
+            {
+                _lodDistanceFactors = new float[lodTransitionHeights.Length];
+                for (int i = 0; i < lodTransitionHeights.Length; i++)
+                    _lodDistanceFactors[i] = math.max(1f, 2f / math.max(0.01f, lodTransitionHeights[i]));
+            }
 
             _brg = new BatchRendererGroup(OnPerformCulling, IntPtr.Zero);
             _materialId = _brg.RegisterMaterial(_material);
 
-            // Global bounds so the group is never culled wholesale; per-section bounds drive real culling later.
+            // Per-LOD tinted material variants (debug view). Each is a clone of the base with _LodColor set.
+            _lodMaterials = new Material[LodDebugColors.Length];
+            _lodMaterialIds = new BatchMaterialID[LodDebugColors.Length];
+            for (int i = 0; i < LodDebugColors.Length; i++)
+            {
+                var m = new Material(_material) { name = $"LodTint{i}" };
+                float4 c = LodDebugColors[i];
+                m.SetVector("_LodColor", new Vector4(c.x, c.y, c.z, 1f));
+                _lodMaterials[i] = m;
+                _lodMaterialIds[i] = _brg.RegisterMaterial(m);
+            }
+
+            // Global bounds so the group is never culled wholesale; per-section bounds drive real culling.
             _brg.SetGlobalBounds(new Bounds(Vector3.zero, Vector3.one * 1_000_000f));
 
             EnsureCapacity(256);
@@ -71,21 +107,31 @@ namespace Fca.MeshTerrain.Streaming
 
         public ISectionHandle Present(CookedSection cooked, Transform root)
         {
-            // Present LOD0. The cooked LOD vertices are already in WORLD space, so the mesh is uploaded as-is
-            // and drawn with an IDENTITY per-instance transform — no per-section translation. This is the
-            // intended design for streamed terrain (the cook produces absolute geometry), and it keeps the
-            // instance buffer trivial (all identity) so the transform path can't misplace tiles.
-            MeshData lod0 = cooked.HasBakedLods ? cooked.Lods[0].Mesh : cooked.Mesh;
-
-            Mesh mesh = MeshDataConversions.ToRenderMesh(lod0, $"BRG_{cooked.Coord.x}_{cooked.Coord.y}_{cooked.Coord.z}");
+            // Upload every baked LOD (cooked vertices are already in WORLD space → identity transform). LOD is
+            // chosen per-frame in OnPerformCulling by camera distance; the same identity instance is reused for
+            // whichever LOD mesh is drawn.
+            int lodCount = cooked.HasBakedLods ? cooked.Lods.Length : 1;
+            var meshes = new Mesh[lodCount];
+            var ids = new BatchMeshID[lodCount];
+            Bounds bounds = default;
+            for (int i = 0; i < lodCount; i++)
+            {
+                MeshData src = cooked.HasBakedLods ? cooked.Lods[i].Mesh : cooked.Mesh;
+                Mesh m = MeshDataConversions.ToRenderMesh(src, $"BRG_{cooked.Coord.x}_{cooked.Coord.y}_{cooked.Coord.z}_L{i}");
+                meshes[i] = m;
+                ids[i] = _brg.RegisterMesh(m);
+                if (i == 0) bounds = m.bounds;
+            }
 
             var slot = new Slot
             {
                 Coord = cooked.Coord,
-                Mesh = mesh,
-                MeshId = _brg.RegisterMesh(mesh),
+                LodMeshes = meshes,
+                LodIds = ids,
                 ObjectToWorld = float4x4.identity,
-                WorldBounds = mesh.bounds,
+                WorldBounds = bounds,
+                Center = (float3)bounds.center,
+                Radius = math.length((float3)bounds.extents),
             };
 
             slot.Index = _live.Count + 1;     // instance 0 reserved
@@ -118,13 +164,24 @@ namespace Fca.MeshTerrain.Streaming
                 _live.RemoveAt(lastIdx);
             }
 
-            _brg.UnregisterMesh(slot.MeshId);
-            if (slot.Mesh != null)
+            DestroyLods(slot);
+        }
+
+        void DestroyLods(Slot slot)
+        {
+            if (slot.LodMeshes == null) return;
+            for (int i = 0; i < slot.LodMeshes.Length; i++)
             {
-                if (Application.isPlaying) UnityEngine.Object.Destroy(slot.Mesh);
-                else UnityEngine.Object.DestroyImmediate(slot.Mesh);
-                slot.Mesh = null;
+                _brg.UnregisterMesh(slot.LodIds[i]);
+                Mesh m = slot.LodMeshes[i];
+                if (m != null)
+                {
+                    if (Application.isPlaying) UnityEngine.Object.Destroy(m);
+                    else UnityEngine.Object.DestroyImmediate(m);
+                }
             }
+            slot.LodMeshes = null;
+            slot.LodIds = null;
         }
 
         // ---- BRG culling callback ----
@@ -140,26 +197,58 @@ namespace Fca.MeshTerrain.Streaming
                 return new JobHandle();
             }
 
-            var draws = cullingOutput.drawCommands;
-            var output = new BatchCullingOutputDrawCommands();
+            // Camera position for distance-based LOD + frustum planes for culling.
+            float3 camPos = cullingContext.lodParameters.cameraPosition;
+            var planes = cullingContext.cullingPlanes; // NativeArray<Plane>
 
-            // One draw command per section (prototype: per-mesh, since each section is a distinct mesh).
-            // Visible-instance array is 1:1 with sections for now (no GPU cull yet).
-            output.visibleInstanceCount = count;
-            output.visibleInstances = Malloc<int>(count);
-            for (int i = 0; i < count; i++) output.visibleInstances[i] = _live[i].Index;
-
-            output.drawCommandCount = count;
-            output.drawCommands = Malloc<BatchDrawCommand>(count);
+            // First pass: frustum-cull + pick a LOD per visible section. Worst case = all visible.
+            int* lodOf = Malloc<int>(count);          // chosen LOD per visible section
+            int* slotOf = Malloc<int>(count);         // _live index per visible section
+            int visible = 0;
             for (int i = 0; i < count; i++)
             {
+                Slot s = _live[i];
+                if (!FrustumIntersects(planes, s.Center, s.Radius)) continue;
+
+                float dist = math.distance(camPos, s.Center);
+                int lod = SelectLod(dist, s.Radius, s.LodMeshes.Length);
+
+                lodOf[visible] = lod;
+                slotOf[visible] = i;
+                visible++;
+            }
+
+            var output = new BatchCullingOutputDrawCommands();
+            if (visible == 0)
+            {
+                UnsafeUtility.Free(lodOf, Allocator.TempJob);
+                UnsafeUtility.Free(slotOf, Allocator.TempJob);
+                output.drawCommandCount = 0;
+                cullingOutput.drawCommands[0] = output;
+                return new JobHandle();
+            }
+
+            // One visible-instance + one draw command per visible section (each is its own mesh).
+            output.visibleInstanceCount = visible;
+            output.visibleInstances = Malloc<int>(visible);
+            output.drawCommandCount = visible;
+            output.drawCommands = Malloc<BatchDrawCommand>(visible);
+            for (int i = 0; i < visible; i++)
+            {
+                Slot s = _live[slotOf[i]];
+                int lod = lodOf[i];
+                output.visibleInstances[i] = s.Index;
+                // Per-LOD tinted material when debugging; otherwise the base material.
+                BatchMaterialID mat = DebugLodColors
+                    ? _lodMaterialIds[math.min(lod, _lodMaterialIds.Length - 1)]
+                    : _materialId;
                 output.drawCommands[i] = new BatchDrawCommand
                 {
                     visibleOffset = (uint)i,
                     visibleCount = 1,
                     batchID = _batchId,
-                    materialID = _materialId,
-                    meshID = _live[i].MeshId,
+                    materialID = mat,
+                    meshID = s.LodIds[lod],
                     submeshIndex = 0,
                     splitVisibilityMask = 0xff,
                     flags = BatchDrawCommandFlags.None,
@@ -173,7 +262,7 @@ namespace Fca.MeshTerrain.Streaming
             output.drawRanges[0] = new BatchDrawRange
             {
                 drawCommandsBegin = 0,
-                drawCommandsCount = (uint)count,
+                drawCommandsCount = (uint)visible,
                 filterSettings = new BatchFilterSettings
                 {
                     renderingLayerMask = 0xffffffff,
@@ -186,8 +275,33 @@ namespace Fca.MeshTerrain.Streaming
                 },
             };
 
-            draws[0] = output;
+            UnsafeUtility.Free(lodOf, Allocator.TempJob);
+            UnsafeUtility.Free(slotOf, Allocator.TempJob);
+
+            cullingOutput.drawCommands[0] = output;
             return new JobHandle();
+        }
+
+        /// <summary>Distance-based LOD: LOD i is used until camera distance exceeds factor[i]*radius, then the
+        /// next coarser LOD; the last LOD is the fallthrough.</summary>
+        int SelectLod(float distance, float radius, int lodCount)
+        {
+            int last = lodCount - 1;
+            for (int i = 0; i < last && i < _lodDistanceFactors.Length; i++)
+                if (distance <= _lodDistanceFactors[i] * radius) return i;
+            return last;
+        }
+
+        /// <summary>Sphere-vs-frustum test (section bounding sphere against the culling planes).</summary>
+        static bool FrustumIntersects(NativeArray<Plane> planes, float3 center, float radius)
+        {
+            for (int p = 0; p < planes.Length; p++)
+            {
+                Plane pl = planes[p];
+                float d = pl.normal.x * center.x + pl.normal.y * center.y + pl.normal.z * center.z + pl.distance;
+                if (d < -radius) return false; // fully outside this plane
+            }
+            return true;
         }
 
         // ---- instance buffer ----
@@ -219,18 +333,23 @@ namespace Fca.MeshTerrain.Streaming
             if (_batchValid) { _brg.RemoveBatch(_batchId); _batchValid = false; }
 
             var metadata = new NativeArray<MetadataValue>(2, Allocator.Temp);
-            uint objOffsetBytes = (uint)(ObjRegionStart * sizeof(float));
-            uint worldOffsetBytes = (uint)(WorldRegionStart * sizeof(float));
-            metadata[0] = new MetadataValue { NameID = Shader.PropertyToID("unity_ObjectToWorld"), Value = 0x80000000 | objOffsetBytes };
-            metadata[1] = new MetadataValue { NameID = Shader.PropertyToID("unity_WorldToObject"), Value = 0x80000000 | worldOffsetBytes };
+            metadata[0] = new MetadataValue { NameID = Shader.PropertyToID("unity_ObjectToWorld"), Value = 0x80000000 | (uint)(ObjRegionStart * sizeof(float)) };
+            metadata[1] = new MetadataValue { NameID = Shader.PropertyToID("unity_WorldToObject"), Value = 0x80000000 | (uint)(WorldRegionStart * sizeof(float)) };
             _batchId = _brg.AddBatch(metadata, _instanceBuffer.bufferHandle);
             _batchValid = true;
             metadata.Dispose();
 
-            // Re-write all live instances into the resized buffer.
             for (int i = 0; i < _live.Count; i++)
                 WriteInstance(_live[i].Index, _live[i].ObjectToWorld);
         }
+
+        static readonly float4[] LodDebugColors =
+        {
+            new float4(0.2f, 1.0f, 0.2f, 1f),  // LOD0 green
+            new float4(1.0f, 0.9f, 0.2f, 1f),  // LOD1 yellow
+            new float4(1.0f, 0.4f, 0.2f, 1f),  // LOD2 orange/red
+            new float4(0.8f, 0.2f, 0.9f, 1f),  // LOD3+ purple
+        };
 
         /// <summary>Writes the packed ObjectToWorld + WorldToObject (float3x4 = 12 floats each) for an instance.</summary>
         void WriteInstance(int index, float4x4 objToWorld)
@@ -271,19 +390,25 @@ namespace Fca.MeshTerrain.Streaming
         public void Dispose()
         {
             foreach (var slot in _slots.Values)
-            {
-                _brg.UnregisterMesh(slot.MeshId);
-                if (slot.Mesh != null)
-                {
-                    if (Application.isPlaying) UnityEngine.Object.Destroy(slot.Mesh);
-                    else UnityEngine.Object.DestroyImmediate(slot.Mesh);
-                }
-            }
+                DestroyLods(slot);
             _slots.Clear();
             _live.Clear();
 
             if (_batchValid) { _brg.RemoveBatch(_batchId); _batchValid = false; }
             _brg.UnregisterMaterial(_materialId);
+            if (_lodMaterials != null)
+            {
+                for (int i = 0; i < _lodMaterials.Length; i++)
+                {
+                    _brg.UnregisterMaterial(_lodMaterialIds[i]);
+                    if (_lodMaterials[i] != null)
+                    {
+                        if (Application.isPlaying) UnityEngine.Object.Destroy(_lodMaterials[i]);
+                        else UnityEngine.Object.DestroyImmediate(_lodMaterials[i]);
+                    }
+                }
+                _lodMaterials = null;
+            }
             _brg.Dispose();
             _instanceBuffer?.Dispose();
             _instanceBuffer = null;
