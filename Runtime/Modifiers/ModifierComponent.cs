@@ -50,5 +50,21 @@ namespace Fca.MeshTerrain
         /// Base modifiers may return null.
         /// </summary>
         public virtual IModifierJob CreateJob() => null;
+
+        /// <summary>
+        /// A stable content hash of this modifier's parameters — the streaming cache's <c>ModifiersHash</c>
+        /// input (<c>doc/08_STREAMING_SYSTEM_DESIGN.md §7.1</c>). Two modifiers that would produce the same
+        /// geometry/weights must return the same hash; any authored change must change it. The base
+        /// implementation folds in the ordering keys; concrete modifiers must override and append their own
+        /// fields. Excludes <see cref="IsDisabled"/> (the set hash tracks membership separately).
+        /// </summary>
+        public virtual Hash128 ComputeParamsHash()
+        {
+            var h = new Hash128();
+            h.Append(PriorityLayer);
+            h.AppendValue(SubPriority);
+            h.Append(GetType().FullName);
+            return h;
+        }
     }
 }

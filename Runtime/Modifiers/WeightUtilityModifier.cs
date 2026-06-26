@@ -41,6 +41,19 @@ namespace Fca.MeshTerrain
         }
 
         public override IModifierJob CreateJob() => new WeightUtilityModifierJob(this);
+
+        public override Hash128 ComputeParamsHash()
+        {
+            var h = base.ComputeParamsHash();
+            h.AppendValue(Center);
+            if (!string.IsNullOrEmpty(WeightChannelName)) h.Append(WeightChannelName);
+            h.Append(Radius);
+            h.Append(Falloff);
+            h.Append(InnerValue);
+            h.Append(OuterValue);
+            h.Append(MaxYDistance);
+            return h;
+        }
     }
 
     /// <summary>Thread-safe op for <see cref="WeightUtilityModifier"/>.</summary>

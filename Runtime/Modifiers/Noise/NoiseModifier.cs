@@ -72,6 +72,29 @@ namespace Fca.MeshTerrain
         }
 
         public override IModifierJob CreateJob() => new NoiseModifierJob(this);
+
+        public override Hash128 ComputeParamsHash()
+        {
+            var h = base.ComputeParamsHash();
+            h.AppendValue(PatchTransform);
+            h.AppendValue(UnscaledCoverage);
+            h.Append((int)DisplacementType);
+            h.Append((int)Parameterization);
+            h.Append((int)FbmMode);
+            h.AppendValue(Intensity);
+            h.AppendValue(Falloff);
+            h.AppendValue(NoiseTranslate);
+            h.AppendValue(NoiseFrequency);
+            h.AppendValue(NoiseRotation);
+            h.Append(FbmOctaves);
+            h.AppendValue(FbmLacunarity);
+            h.AppendValue(FbmGain);
+            h.AppendValue(FbmSmoothness);
+            h.AppendValue(FbmGamma);
+            h.Append(WriteToWeightChannel ? 1 : 0);
+            if (!string.IsNullOrEmpty(WeightChannelName)) h.Append(WeightChannelName);
+            return h;
+        }
     }
 
     /// <summary>The thread-safe op for <see cref="NoiseModifier"/>. Port of UE <c>FNoiseBackgroundOp</c>.</summary>

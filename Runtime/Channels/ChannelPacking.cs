@@ -68,6 +68,12 @@ namespace Fca.MeshTerrain
             return new ChannelTable(words, sliceForChannel.Length);
         }
 
+        /// <summary>
+        /// Reconstructs a table from its already-packed <paramref name="words"/> and slot count — used by
+        /// the streaming cache's blob (de)serializer to round-trip a table without re-deriving slice indices.
+        /// </summary>
+        public static ChannelTable FromWords(uint4 words, int slotCount) => new ChannelTable(words, slotCount);
+
         /// <summary>Reads back the texture slice for global channel <paramref name="channel"/>.</summary>
         public int GetSlice(int channel)
         {

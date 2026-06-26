@@ -33,6 +33,18 @@ namespace Fca.MeshTerrain
 
         public override double GetComplexity() => (Resolution.x + 1) * (Resolution.y + 1);
 
+        public override Hash128 ComputeParamsHash()
+        {
+            var h = base.ComputeParamsHash();
+            h.AppendValue(Resolution);
+            h.AppendValue(Size);
+            h.AppendValue(Center);
+            // HeightFn is a delegate (no stable identity); callers that vary the height field must bump the
+            // variant/class hash. Flagged here so a heightmap importer can fold its source hash in later.
+            h.Append(HeightFn != null ? 1 : 0);
+            return h;
+        }
+
         public override Bounds ComputeBounds()
         {
             float maxH = 0f;
