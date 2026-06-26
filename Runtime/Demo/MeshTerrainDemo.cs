@@ -23,6 +23,7 @@ namespace Fca.MeshTerrain.Demo
             Phase1_PartitionColored,  // partition a plane -> one colored GO per section
             Phase2_NoisePartition,    // modifier stack (Rectangle + Noise + paint) -> partition -> colored
             Phase3_CompiledSections,  // modifier stack -> partition -> LOD/skirt/collision section compiler
+            Phase4_ChannelAtlas,      // modifier stack -> partition -> compile w/ channel atlas + URP material
         }
 
         [Header("What to build")]
@@ -51,6 +52,13 @@ namespace Fca.MeshTerrain.Demo
         public float skirtPushDown = 0f;    // 0 = cell-size default
         public float[] lodQualities = { 1f, 0.5f, 0.25f };
         public float[] lodTransitionHeights = { 0.6f, 0.3f, 0.1f };
+
+        [Header("Channel Atlas (Phase 4)")]
+        public bool generateChannels = true;
+        public bool channelGutterFill = true;
+        public float channelTexelSize = 20f;   // smaller = higher-res atlas for the demo plane
+        [Tooltip("Tint compiled sections by the section debug color in addition to the channel material.")]
+        public bool tintSections = false;
 
         // Tracked so we can fully tear down between rebuilds. Meshes are tracked separately because
         // destroying a GameObject does NOT free the Mesh it referenced — that was the "old meshes still
@@ -106,6 +114,7 @@ namespace Fca.MeshTerrain.Demo
                 case Mode.Phase1_PartitionColored: BuildPhase1(); break;
                 case Mode.Phase2_NoisePartition: BuildPhase2(); break;
                 case Mode.Phase3_CompiledSections: BuildPhase3(); break;
+                case Mode.Phase4_ChannelAtlas: BuildPhase4(); break;
             }
         }
 
@@ -222,6 +231,66 @@ namespace Fca.MeshTerrain.Demo
             }
             finally { built.Dispose(); }
         }
+
+        void BuildPhase4()
+        {
+            var rect = new RectangleBaseModifier
+            {
+                Resolution = new int2(resolution, resolution),
+                Size = new float2(size, size),
+            };
+            var noise = new NoiseModifier
+            {
+                UnscaledCoverage = new float3(size * 1.5f, 400f, size * 1.5f),
+                Intensity = noiseIntensity,
+                DisplacementType = NoiseType.Fbm,
+                NoiseFrequency = new double2(noiseFrequency, noiseFrequency),
+                Falloff = 0.1,
+            };
+            var paint = new WeightUtilityModifier
+            {
+                WeightChannelName = paintChannel,
+                Radius = paintRadius, Falloff = paintFalloff,
+                InnerValue = 1f, OuterValue = 0f,
+            };
+
+            var stack = new List<ModifierComponent> { rect, noise, paint };
+            var built = ModifierGroup.Process(stack, float4x4.identity, Allocator.TempJob);
+            try
+            {
+                var grid = new GridSettings { CellSize = cellSize, Is2D = true };
+                var result = MeshPartitioner.Partition(built.Mesh, grid, built.Weights, Allocator.TempJob);
+                try
+                {
+                    var settings = new SectionCompilationSettings
+                    {
+                        Material = material,
+                        GenerateLODs = generateLODs,
+                        GenerateCollision = generateCollision,
+                        LODQualities = lodQualities,
+                        LODScreenRelativeTransitionHeights = lodTransitionHeights,
+                        Skirt = MeshSkirtSettings.DefaultForCellSize(cellSize),
+                        GenerateChannels = generateChannels,
+                        ChannelGutterFill = channelGutterFill,
+                    };
+                    settings.Skirt.Enabled = generateSkirts;
+                    if (skirtWidth > 0f) settings.Skirt.Width = skirtWidth;
+                    if (skirtPushDown > 0f) settings.Skirt.PushDown = skirtPushDown;
+                    settings.ChannelUVSettings = ChannelUVSettings.Default;
+                    settings.ChannelUVSettings.TexelSize3D = channelTexelSize;
+
+                    var compiled = SectionCompiler.Compile(result, settings, transform);
+                    for (int i = 0; i < compiled.Length; i++)
+                    {
+                        _compiledSections.Add(compiled[i]);
+                        if (tintSections)
+                            ApplySectionColor(compiled[i], ColorFor(i));
+                    }
+                }
+                finally { result.Dispose(); }
+            }
+            finally { built.Dispose(); }
+        }
         // ---- helpers ----
 
         static MeshData MakePlane(int cells, float size, Allocator alloc)
@@ -277,11 +346,15 @@ namespace Fca.MeshTerrain.Demo
         static void ApplySectionColor(CompiledSection section, Color color)
         {
             if (section?.Root == null) return;
+            // Read-modify-write per renderer so we don't clobber channel-atlas props (Phase 4).
             var mpb = new MaterialPropertyBlock();
-            mpb.SetColor("_BaseColor", color);
-            mpb.SetColor("_Color", color);
             foreach (var renderer in section.Root.GetComponentsInChildren<MeshRenderer>())
+            {
+                renderer.GetPropertyBlock(mpb);
+                mpb.SetColor("_BaseColor", color);
+                mpb.SetColor("_Color", color);
                 renderer.SetPropertyBlock(mpb);
+            }
         }
         void Clear()
         {
