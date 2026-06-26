@@ -85,6 +85,13 @@ namespace Fca.MeshTerrain.Demo
         [Tooltip("Record per-phase timings; press P in Play mode to dump the full report to the Console.")]
         public bool streamProfiling = true;
 
+        public enum PresenterBackend { GameObject, BatchRendererGroup }
+        [Tooltip("Rendering backend: GameObject (per-section MeshRenderer/LODGroup) or BatchRendererGroup " +
+                 "(GPU-instanced, no GameObjects — milestone 5.6a prototype, flat material, LOD0 only).")]
+        public PresenterBackend presenterBackend = PresenterBackend.GameObject;
+        [Tooltip("Flat instanced material for the BRG backend (uses 'Mesh Terrain/Instanced Flat' if unset).")]
+        public Material instancedMaterial;
+
         // Tracked so we can fully tear down between rebuilds. Meshes are tracked separately because
         // destroying a GameObject does NOT free the Mesh it referenced — that was the "old meshes still
         // in the scene" leak.
@@ -92,6 +99,7 @@ namespace Fca.MeshTerrain.Demo
         readonly List<Mesh> _meshes = new();
         readonly List<CompiledSection> _compiledSections = new();
         Fca.MeshTerrain.Streaming.MeshTerrainStreamer _streamer;
+        Fca.MeshTerrain.Streaming.BatchRendererGroupSectionPresenter _brgPresenter;
 
         void OnEnable() => RequestRebuild();
 
@@ -359,7 +367,16 @@ namespace Fca.MeshTerrain.Demo
             settings.Skirt.Enabled = generateSkirts;
             settings.ChannelUVSettings = ChannelUVSettings.Default;
             settings.ChannelUVSettings.TexelSize3D = channelTexelSize;
-            _streamer.SetPresenter(new Fca.MeshTerrain.Streaming.GameObjectSectionPresenter(settings));
+
+            if (presenterBackend == PresenterBackend.BatchRendererGroup)
+            {
+                _brgPresenter = new Fca.MeshTerrain.Streaming.BatchRendererGroupSectionPresenter(instancedMaterial);
+                _streamer.SetPresenter(_brgPresenter);
+            }
+            else
+            {
+                _streamer.SetPresenter(new Fca.MeshTerrain.Streaming.GameObjectSectionPresenter(settings));
+            }
 
             // Larger streaming cells -> fewer, bigger tiles in the load ring.
             var def = ScriptableObject.CreateInstance<MeshPartitionDefinition>();
@@ -536,7 +553,15 @@ namespace Fca.MeshTerrain.Demo
             if (_streamer != null)
             {
                 if (_streamer.Definition != null) DestroyObject(_streamer.Definition);
+                _streamer.ForceUnloadAll();   // releases all section handles (BRG slots) before we dispose the BRG
                 _streamer = null;
+            }
+
+            // Dispose the BRG presenter (BatchRendererGroup + GraphicsBuffer) after sections are released.
+            if (_brgPresenter != null)
+            {
+                _brgPresenter.Dispose();
+                _brgPresenter = null;
             }
 
             foreach (var compiled in _compiledSections) compiled.Dispose();
