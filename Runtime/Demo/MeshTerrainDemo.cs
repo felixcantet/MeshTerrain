@@ -56,6 +56,7 @@ namespace Fca.MeshTerrain.Demo
         [Header("Channel Atlas (Phase 4)")]
         public bool generateChannels = true;
         public bool channelGutterFill = true;
+        public bool useComputeRasterizer = false;  // Phase 4b: GPU backend (falls back to CPU if unsupported)
         public float channelTexelSize = 20f;   // smaller = higher-res atlas for the demo plane
         [Tooltip("Tint compiled sections by the section debug color in addition to the channel material.")]
         public bool tintSections = false;
@@ -272,6 +273,9 @@ namespace Fca.MeshTerrain.Demo
                         Skirt = MeshSkirtSettings.DefaultForCellSize(cellSize),
                         GenerateChannels = generateChannels,
                         ChannelGutterFill = channelGutterFill,
+                        ChannelRasterizer = useComputeRasterizer
+                            ? ChannelRasterizerBackend.Compute
+                            : ChannelRasterizerBackend.CPU,
                     };
                     settings.Skirt.Enabled = generateSkirts;
                     if (skirtWidth > 0f) settings.Skirt.Width = skirtWidth;

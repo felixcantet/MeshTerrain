@@ -1,0 +1,65 @@
+// Pull-push gutter fill (Phase 4b GPU backend). Direct port of UE MeshPartitionBorderFill.usf
+// PullCS/PushCS. Pull builds a mip pyramid by mask-weighted downsample; Push backfills holes in
+// finer levels from the coarser ones. Single channel slice (signal as float, mask as float).
+#pragma kernel Pull
+#pragma kernel Push
+
+int2 _ResolutionPass;   // resolution of the level being written this dispatch
+float2 _TexelSize;      // 1 / sourceResolution, for the Push bilinear sample
+
+Texture2D<float>    _SignalIn;
+RWTexture2D<float>  _SignalOut;
+Texture2D<float>    _MaskIn;
+RWTexture2D<float>  _MaskOut;
+SamplerState        sampler_linear_clamp;
+
+[numthreads(8, 8, 1)]
+void Pull(uint2 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint2)_ResolutionPass))
+        return;
+
+    int2 dst = int2(id);
+    int2 src = dst * 2;
+    float signal = 0;
+    float mask = 0;
+
+    [unroll]
+    for (int i = 0; i < 2; ++i)
+    {
+        [unroll]
+        for (int j = 0; j < 2; ++j)
+        {
+            float m = _MaskIn.Load(int3(src + int2(i, j), 0));
+            float s = _SignalIn.Load(int3(src + int2(i, j), 0));
+            signal += m * s;
+            mask += m;
+        }
+    }
+
+    if (mask > 0)
+    {
+        signal = signal / mask;
+        mask *= 0.25;
+    }
+    else
+    {
+        signal = 0;
+        mask = 0;
+    }
+
+    _SignalOut[dst] = signal;
+    _MaskOut[dst] = mask;
+}
+
+[numthreads(8, 8, 1)]
+void Push(uint2 id : SV_DispatchThreadID)
+{
+    // _MaskIn is this level's coverage; only holes (mask==0) are backfilled. Point-sample the
+    // coarser level (nearest x/2,y/2) to match the CPU path exactly rather than bilinear.
+    if (any(id >= (uint2)_ResolutionPass) || _MaskIn[id] > 0.5)
+        return;
+
+    int2 src = int2(id) / 2;
+    _SignalOut[id] = _SignalIn.Load(int3(src, 0));
+}

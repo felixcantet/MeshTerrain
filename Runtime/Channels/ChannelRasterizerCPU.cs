@@ -5,14 +5,17 @@ using UnityEngine;
 namespace Fca.MeshTerrain
 {
     /// <summary>
-    /// Result of rasterizing a section's channels: a single-channel texture per weight layer packed
-    /// into a <see cref="Texture2DArray"/> (slice i = global channel i), plus the
-    /// <see cref="ChannelTable"/> describing which slice each channel landed in and the per-section
-    /// texcoord metric for the material.
+    /// Result of rasterizing a section's channels: a single-channel image per weight layer (slice i =
+    /// global channel i), plus the <see cref="ChannelTable"/> describing which slice each channel
+    /// landed in and the per-section texcoord metric for the material.
+    ///
+    /// The CPU backend stores a <see cref="Texture2DArray"/>; the GPU backend (Phase 4b) stores a
+    /// <see cref="RenderTexture"/> array (kept live, no readback). Both expose the array slices as a
+    /// single <see cref="Texture"/> so the material/<c>CompiledSection</c> path is backend-agnostic.
     /// </summary>
     public sealed class ChannelRasterResult : IDisposable
     {
-        public Texture2DArray Texture;
+        public Texture Texture;
         public ChannelTable Table;
         public float2 TexcoordMetrics;
 
@@ -20,7 +23,13 @@ namespace Fca.MeshTerrain
         {
             if (Texture != null)
             {
-                if (Application.isPlaying) UnityEngine.Object.Destroy(Texture);
+                if (Texture is RenderTexture rt)
+                {
+                    rt.Release();
+                    if (Application.isPlaying) UnityEngine.Object.Destroy(rt);
+                    else UnityEngine.Object.DestroyImmediate(rt);
+                }
+                else if (Application.isPlaying) UnityEngine.Object.Destroy(Texture);
                 else UnityEngine.Object.DestroyImmediate(Texture);
                 Texture = null;
             }
