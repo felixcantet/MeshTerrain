@@ -24,6 +24,7 @@ namespace Fca.MeshTerrain.Demo
             Phase2_NoisePartition,    // modifier stack (Rectangle + Noise + paint) -> partition -> colored
             Phase3_CompiledSections,  // modifier stack -> partition -> LOD/skirt/collision section compiler
             Phase4_ChannelAtlas,      // modifier stack -> partition -> compile w/ channel atlas + URP material
+            Phase5_Streaming,         // MeshTerrainStreamer: cook-on-miss + cache + distance-driven load/unload
         }
 
         [Header("What to build")]
@@ -61,12 +62,36 @@ namespace Fca.MeshTerrain.Demo
         [Tooltip("Tint compiled sections by the section debug color in addition to the channel material.")]
         public bool tintSections = false;
 
+        [Header("Streaming (Phase 5)")]
+        [Tooltip("Focus transform driving streaming (defaults to Camera.main at runtime).")]
+        public Transform streamFocus;
+        [Tooltip("Streaming cell size (world units). Larger = fewer, bigger tiles -> far fewer GameObjects/" +
+                 "uploads/colliders in the load ring (the present cost is per-tile and main-thread).")]
+        public float streamCellSize = 200f;
+        [Tooltip("Quads per side per streaming tile. Lower = lighter mesh upload per tile.")]
+        public int streamTileResolution = 32;
+        [Tooltip("Half-extent of the streamed world (world units); the base rectangle spans 2x this.")]
+        public float streamWorldExtent = 2000f;
+        public float loadDistance = 500f;
+        public float unloadDistance = 1000f;   // >=2 cells of hysteresis band to avoid boundary thrash
+        public int maxConcurrentCooks = 4;
+        [Tooltip("Hard cap on tiles presented per frame (each present is a main-thread mesh upload + collider). " +
+                 "Present is ~1.4ms now, so a few per frame fills the ring faster while staying smooth.")]
+        public int maxPresentsPerFrame = 3;
+        public float maxMillisPerFrame = 6f;
+        [Tooltip("Collision mesh quality: 1 = full-res, lower = cheaper PhysX cook (collision baked unskirted in the cook).")]
+        public float collisionQuality = 0.25f;
+        public float worldHeight = 4000f;
+        [Tooltip("Record per-phase timings; press P in Play mode to dump the full report to the Console.")]
+        public bool streamProfiling = true;
+
         // Tracked so we can fully tear down between rebuilds. Meshes are tracked separately because
         // destroying a GameObject does NOT free the Mesh it referenced — that was the "old meshes still
         // in the scene" leak.
         readonly List<GameObject> _spawned = new();
         readonly List<Mesh> _meshes = new();
         readonly List<CompiledSection> _compiledSections = new();
+        Fca.MeshTerrain.Streaming.MeshTerrainStreamer _streamer;
 
         void OnEnable() => RequestRebuild();
 
@@ -116,6 +141,7 @@ namespace Fca.MeshTerrain.Demo
                 case Mode.Phase2_NoisePartition: BuildPhase2(); break;
                 case Mode.Phase3_CompiledSections: BuildPhase3(); break;
                 case Mode.Phase4_ChannelAtlas: BuildPhase4(); break;
+                case Mode.Phase5_Streaming: BuildPhase5(); break;
             }
         }
 
@@ -295,6 +321,149 @@ namespace Fca.MeshTerrain.Demo
             }
             finally { built.Dispose(); }
         }
+        void BuildPhase5()
+        {
+            // Spawn (or reuse) a streamer on a child GO and drive it with a code-supplied modifier stack.
+            // Streaming itself runs in Play mode (the streamer's Update). In edit mode this just configures it.
+            var go = new GameObject("MeshTerrainStreamer") { hideFlags = HideFlags.DontSave };
+            go.transform.SetParent(transform, false);
+            _spawned.Add(go);
+
+            _streamer = go.AddComponent<Fca.MeshTerrain.Streaming.MeshTerrainStreamer>();
+            _streamer.Focus = streamFocus;
+            _streamer.WorldOriginOffset = Vector3.zero;
+            _streamer.WorldHeight = worldHeight;
+            _streamer.LoadDistance = loadDistance;
+            _streamer.UnloadDistance = unloadDistance;
+            _streamer.MaxConcurrentCooks = maxConcurrentCooks;
+            _streamer.MaxPresentsPerFrame = maxPresentsPerFrame;
+            _streamer.MaxMillisPerFrame = maxMillisPerFrame;
+            _streamer.GenerateChannels = generateChannels;
+            _streamer.RamCapacity = 256;
+
+            var settings = new SectionCompilationSettings
+            {
+                Material = material,
+                GenerateLODs = generateLODs,
+                GenerateCollision = generateCollision,
+                CollisionQuality = collisionQuality,
+                LODQualities = lodQualities,
+                LODScreenRelativeTransitionHeights = lodTransitionHeights,
+                Skirt = MeshSkirtSettings.DefaultForCellSize(streamCellSize),
+                GenerateChannels = generateChannels,
+                ChannelGutterFill = channelGutterFill,
+                ChannelRasterizer = useComputeRasterizer
+                    ? ChannelRasterizerBackend.Compute
+                    : ChannelRasterizerBackend.CPU,
+            };
+            settings.Skirt.Enabled = generateSkirts;
+            settings.ChannelUVSettings = ChannelUVSettings.Default;
+            settings.ChannelUVSettings.TexelSize3D = channelTexelSize;
+            _streamer.SetPresenter(new Fca.MeshTerrain.Streaming.GameObjectSectionPresenter(settings));
+
+            // Larger streaming cells -> fewer, bigger tiles in the load ring.
+            var def = ScriptableObject.CreateInstance<MeshPartitionDefinition>();
+            def.hideFlags = HideFlags.DontSave;
+            def.name = "DemoStreamingDef";
+            def.CellSize = (uint)Mathf.Max(1f, streamCellSize);
+            def.Is2D = true;
+            def.Material = material;
+            def.ChannelTexelSize = channelTexelSize;
+            _streamer.Definition = def;
+
+            _streamer.SetModifierStack(BuildStreamingStack());
+            Fca.MeshTerrain.Streaming.StreamingDiagnostics.Reset();
+            Fca.MeshTerrain.Streaming.StreamingProfiler.Reset();
+            Fca.MeshTerrain.Streaming.StreamingProfiler.Enabled = streamProfiling;
+        }
+
+        List<ModifierComponent> BuildStreamingStack()
+        {
+            // The base rectangle spans the whole streamed world; its resolution is chosen so each streaming
+            // cell carries ~streamTileResolution quads/side (keeps per-tile mesh upload light).
+            float worldSpan = streamWorldExtent * 2f;
+            int cellsPerSide = Mathf.Max(1, Mathf.RoundToInt(worldSpan / Mathf.Max(1f, streamCellSize)));
+            int totalQuads = Mathf.Max(1, cellsPerSide * Mathf.Max(1, streamTileResolution));
+            var rect = new RectangleBaseModifier
+            {
+                Resolution = new int2(totalQuads, totalQuads),
+                Size = new float2(worldSpan, worldSpan),
+            };
+            var noise = new NoiseModifier
+            {
+                UnscaledCoverage = new float3(worldSpan * 1.5f, 400f, worldSpan * 1.5f),
+                Intensity = noiseIntensity,
+                DisplacementType = NoiseType.Fbm,
+                NoiseFrequency = new double2(noiseFrequency, noiseFrequency),
+                Falloff = 0.1,
+            };
+            var paint = new WeightUtilityModifier
+            {
+                WeightChannelName = paintChannel,
+                Radius = paintRadius, Falloff = paintFalloff,
+                InnerValue = 1f, OuterValue = 0f,
+            };
+            return new List<ModifierComponent> { rect, noise, paint };
+        }
+
+        void OnDrawGizmosSelected()
+        {
+            if (mode != Mode.Phase5_Streaming) return;
+            Transform f = streamFocus != null ? streamFocus : (Camera.main != null ? Camera.main.transform : null);
+            if (f == null) return;
+            Vector3 c = f.position; c.y = 0f;
+            Gizmos.color = Color.green; DrawRing(c, loadDistance);
+            Gizmos.color = Color.yellow; DrawRing(c, unloadDistance);
+        }
+
+        static void DrawRing(Vector3 center, float radius)
+        {
+            const int seg = 48;
+            Vector3 prev = center + new Vector3(radius, 0, 0);
+            for (int i = 1; i <= seg; i++)
+            {
+                float a = (i / (float)seg) * Mathf.PI * 2f;
+                Vector3 p = center + new Vector3(Mathf.Cos(a) * radius, 0, Mathf.Sin(a) * radius);
+                Gizmos.DrawLine(prev, p);
+                prev = p;
+            }
+        }
+
+        void Update()
+        {
+            if (mode != Mode.Phase5_Streaming || !Application.isPlaying || _streamer == null) return;
+            if (Input.GetKeyDown(KeyCode.P))
+                Debug.Log(_streamer.ProfilerReport());
+        }
+
+        void OnGUI()
+        {
+            if (mode != Mode.Phase5_Streaming || _streamer == null) return;
+            int hits = Fca.MeshTerrain.Streaming.StreamingDiagnostics.CacheHits;
+            int misses = Fca.MeshTerrain.Streaming.StreamingDiagnostics.CacheMisses;
+            int cooks = Fca.MeshTerrain.Streaming.StreamingDiagnostics.Cooks;
+
+            GUILayout.BeginArea(new Rect(10, 10, 360, 220), GUI.skin.box);
+            GUILayout.Label($"Resident: {_streamer.residentCount}   Queued: {_streamer.queuedCount}   In-flight: {_streamer.pendingCount}");
+            GUILayout.Label($"Live sections: {Fca.MeshTerrain.Streaming.StreamingDiagnostics.LiveSections}");
+            GUILayout.Label($"Reused (cache hit): {hits}   Cooked (miss): {misses}   Cooks: {cooks}");
+            GUILayout.Label($"Cooks cancelled (churn): {Fca.MeshTerrain.Streaming.StreamingDiagnostics.CooksCancelled}");
+            float reuseRate = (hits + misses) > 0 ? 100f * hits / (hits + misses) : 0f;
+            GUILayout.Label($"Reuse rate: {reuseRate:F0}%   (high = baked tiles served, no re-pipeline)");
+            GUILayout.Label($"Last finalize: {_streamer.lastFinalizeMs:F1} ms for {_streamer.lastFinalizedCount} section(s)");
+
+            // Top phases inline so the bottleneck is visible without the Console dump.
+            var phases = Fca.MeshTerrain.Streaming.StreamingProfiler.Phases;
+            if (phases.Count > 0)
+            {
+                GUILayout.Label("Phases (avg ms / max ms):");
+                foreach (var kvp in phases)
+                    GUILayout.Label($"  {kvp.Key}: {kvp.Value.AvgMs:F2} / {kvp.Value.MaxMs:F2}  (n={kvp.Value.Count})");
+            }
+            GUILayout.Label("Press P to dump full report to Console.");
+            GUILayout.EndArea();
+        }
+
         // ---- helpers ----
 
         static MeshData MakePlane(int cells, float size, Allocator alloc)
@@ -362,6 +531,14 @@ namespace Fca.MeshTerrain.Demo
         }
         void Clear()
         {
+            // The streamer tears itself down (OnDisable -> ForceUnloadAll + cache dispose) when its GO is
+            // destroyed below; drop the managed Definition we created for it.
+            if (_streamer != null)
+            {
+                if (_streamer.Definition != null) DestroyObject(_streamer.Definition);
+                _streamer = null;
+            }
+
             foreach (var compiled in _compiledSections) compiled.Dispose();
             _compiledSections.Clear();
 

@@ -48,7 +48,7 @@ namespace Fca.MeshTerrain.Tests
         {
             var stack = SampleStack();
             var (grid, dims, coord) = Setup(stack);
-            var cooked = SectionCooker.Cook(stack, grid, dims, coord, 10f, ChannelCookOptions.Default, float4x4.identity, Allocator.TempJob);
+            var cooked = SectionCooker.Cook(stack, grid, dims, coord, 10f, ChannelCookOptions.Default, LodCookOptions.Default, float4x4.identity, Allocator.TempJob);
 
             var root = new GameObject("PresenterTestRoot");
             var presenter = new GameObjectSectionPresenter(Settings());
@@ -84,7 +84,7 @@ namespace Fca.MeshTerrain.Tests
             var stack = SampleStack();
             var (grid, dims, coord) = Setup(stack);
             var channels = new ChannelCookOptions { Generate = true, TexelSize3D = 100f, GutterFill = true };
-            var cooked = SectionCooker.Cook(stack, grid, dims, coord, 10f, channels, float4x4.identity, Allocator.TempJob);
+            var cooked = SectionCooker.Cook(stack, grid, dims, coord, 10f, channels, LodCookOptions.Default, float4x4.identity, Allocator.TempJob);
 
             var root = new GameObject("PresenterTestRoot");
             var presenter = new GameObjectSectionPresenter(Settings());

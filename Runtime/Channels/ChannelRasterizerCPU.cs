@@ -37,6 +37,50 @@ namespace Fca.MeshTerrain
     }
 
     /// <summary>
+    /// Unity-object-free result of a thread-safe channel rasterization: a tightly-packed R8 atlas blob
+    /// (slice 0 first, then slice 1, …) plus the packing table + texcoord metric. Built on a worker thread by
+    /// <see cref="ChannelRasterizerCPU.RenderToBytes"/>; <see cref="ToTexture2DArray"/> uploads it on the
+    /// main thread. This is what lets the cook run async (<c>doc/08 §8</c>).
+    /// </summary>
+    public struct ChannelRasterBytes
+    {
+        public int Resolution;
+        public int Slices;
+        public byte[] R8;
+        public ChannelTable Table;
+        public Unity.Mathematics.float2 TexcoordMetrics;
+
+        public bool HasData => R8 != null && R8.Length > 0;
+
+        /// <summary>Builds the R8 <see cref="Texture2DArray"/> from the blob. <b>Main thread only.</b></summary>
+        public Texture2DArray ToTexture2DArray(string name = "SectionChannels")
+        {
+            int res = Resolution;
+            int slices = math.max(1, Slices);
+            var tex = new Texture2DArray(res, res, slices, TextureFormat.R8, mipChain: true, linear: true)
+            {
+                name = name,
+                wrapMode = TextureWrapMode.Clamp,
+                filterMode = FilterMode.Bilinear,
+            };
+            int sliceBytes = res * res;
+            var px = new Color32[sliceBytes];
+            for (int s = 0; s < slices; s++)
+            {
+                int offset = s * sliceBytes;
+                for (int i = 0; i < sliceBytes; i++)
+                {
+                    byte b = R8[offset + i];
+                    px[i] = new Color32(b, b, b, 255);
+                }
+                tex.SetPixels32(px, s);
+            }
+            tex.Apply(updateMipmaps: true);
+            return tex;
+        }
+    }
+
+    /// <summary>
     /// CPU port of UE's channel rasterization pipeline
     /// (<c>MeshPartitionMakeSectionChannels.usf</c>, <c>MeshPartitionBorderFill.usf</c>): for each
     /// section it rasterizes per-vertex weight layers into a texture in the channel-UV domain, then
@@ -55,6 +99,27 @@ namespace Fca.MeshTerrain
         /// pull-push pass is "optional first" per the roadmap). Caller owns the result.
         /// </summary>
         public static ChannelRasterResult Render(
+            in MeshData section,
+            WeightLayerSet weights,
+            in SectionDomainMapping mapping,
+            bool enableGutterFill = true)
+        {
+            ChannelRasterBytes bytes = RenderToBytes(section, weights, mapping, enableGutterFill);
+            return new ChannelRasterResult
+            {
+                Texture = bytes.ToTexture2DArray(),
+                Table = bytes.Table,
+                TexcoordMetrics = bytes.TexcoordMetrics,
+            };
+        }
+
+        /// <summary>
+        /// Pure (Unity-object-free, <b>thread-safe</b>) rasterization: runs passes 1–3 and packs the result
+        /// into a tightly-packed R8 byte blob + table + metrics, without allocating a <see cref="Texture2DArray"/>.
+        /// This is the path the async cook (<c>doc/08 §8</c>) calls on a worker thread; the texture is built
+        /// later on the main thread via <see cref="ChannelRasterBytes.ToTexture2DArray"/>.
+        /// </summary>
+        public static ChannelRasterBytes RenderToBytes(
             in MeshData section,
             WeightLayerSet weights,
             in SectionDomainMapping mapping,
@@ -90,33 +155,25 @@ namespace Fca.MeshTerrain
             if (enableGutterFill)
                 PullPushFill(signal, mask, sliceCount, res);
 
-            // ---- Pack into a Texture2DArray (R8) and build the channel table. ----
-            var tex = new Texture2DArray(res, res, sliceCount, TextureFormat.R8, mipChain: true, linear: true)
-            {
-                name = "SectionChannels",
-                wrapMode = TextureWrapMode.Clamp,
-                filterMode = FilterMode.Bilinear,
-            };
-            var px = new Color32[res * res];
+            // ---- Pack into a tightly-packed R8 blob (slice 0 first, then slice 1, …). ----
+            var blob = new byte[res * res * sliceCount];
             for (int s = 0; s < sliceCount; s++)
             {
                 var src = signal[s];
+                int offset = s * res * res;
                 for (int i = 0; i < src.Length; i++)
-                {
-                    byte b = (byte)math.clamp((int)math.round(src[i] * 255f), 0, 255);
-                    px[i] = new Color32(b, b, b, 255);
-                }
-                tex.SetPixels32(px, s);
+                    blob[offset + i] = (byte)math.clamp((int)math.round(src[i] * 255f), 0, 255);
             }
-            tex.Apply(updateMipmaps: true);
 
             // Slice mapping: channel i -> slice i (1:1 here). Absent if no layers.
             var sliceForChannel = new int[layerCount];
             for (int c = 0; c < layerCount; c++) sliceForChannel[c] = c;
 
-            return new ChannelRasterResult
+            return new ChannelRasterBytes
             {
-                Texture = tex,
+                Resolution = res,
+                Slices = sliceCount,
+                R8 = blob,
                 Table = ChannelTable.Build(sliceForChannel),
                 TexcoordMetrics = mapping.TexcoordMetrics,
             };

@@ -38,8 +38,15 @@ namespace Fca.MeshTerrain.Streaming
             var settings = Clone(_settings);
             settings.GenerateChannels = false;
 
-            CompiledSection compiled = SectionCompiler.CompileSection(
-                cooked.Mesh, cooked.Weights, cooked.Dims, cooked.Coord, settings, root);
+            // Fast path: the cook already baked the skirt + LOD chain on a worker thread, so the present is
+            // upload-only (no main-thread simplification — the profiler's ~68 ms/section bottleneck). Falls
+            // back to the full compile only for sections cooked without baked LODs.
+            // Use the cook-baked collision mesh (unskirted, simplified) when present; else the full mesh.
+            MeshData collisionSource = cooked.HasBakedCollision ? cooked.CollisionMesh : cooked.Mesh;
+
+            CompiledSection compiled = cooked.HasBakedLods
+                ? SectionCompiler.CompilePrebaked(cooked.Lods, collisionSource, cooked.Dims, cooked.Coord, settings, root)
+                : SectionCompiler.CompileSection(cooked.Mesh, cooked.Weights, cooked.Dims, cooked.Coord, settings, root);
 
             Texture2DArray atlas = null;
             if (cooked.HasAtlas)

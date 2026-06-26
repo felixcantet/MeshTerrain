@@ -107,18 +107,36 @@ namespace Fca.MeshTerrain.Streaming
 
         public void Put(in SectionKey key, CookedSection cooked)
         {
-            // Disk first (durable), then RAM.
-            try
+            // Prefer the blob serialized on the cook's worker thread (no main-thread serialization spike).
+            // Fall back to serializing here only if it wasn't prebuilt (e.g. a synchronous ForceLoad path).
+            byte[] bytes = cooked.SerializedBlob;
+            if (bytes == null)
             {
-                string path = PathFor(key);
-                using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
-                SectionBlob.Write(fs, cooked);
-            }
-            catch (Exception e)
-            {
-                Debug.LogWarning($"SectionCache: failed to write blob for {key.Coord} ({e.Message}).");
+                try
+                {
+                    using var ms = new MemoryStream();
+                    SectionBlob.Write(ms, cooked);
+                    bytes = ms.ToArray();
+                }
+                catch (Exception e)
+                {
+                    Debug.LogWarning($"SectionCache: failed to serialize blob for {key.Coord} ({e.Message}).");
+                }
             }
 
+            if (bytes != null)
+            {
+                string path = PathFor(key);
+                System.Threading.Tasks.Task.Run(() =>
+                {
+                    try { File.WriteAllBytes(path, bytes); }
+                    catch (Exception e) { Debug.LogWarning($"SectionCache: async disk write failed for {path} ({e.Message})."); }
+                });
+            }
+
+            // Drop the (potentially large) serialized blob now that it's queued for disk; the RAM tier keeps
+            // the live CookedSection, not the bytes.
+            cooked.SerializedBlob = null;
             InsertRam(key, cooked);
         }
 

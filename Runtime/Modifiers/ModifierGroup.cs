@@ -110,8 +110,10 @@ namespace Fca.MeshTerrain
             ApplyModifiers(ordered, boundedMesh, boundedWeights, meshToWorld, cellBounds);
 
             // Partition the bounded mesh with the same anchor, then extract the requested cell. The stable
-            // anchor makes the absolute coordinates line up with a full build (§6.3).
-            var partition = MeshPartitioner.Partition(boundedMesh, grid, boundedWeights, allocator);
+            // anchor makes the absolute coordinates line up with a full build (§6.3). Uses the Job-free
+            // immediate partition so ProcessCell (and the async cook that wraps it) is thread-safe — the
+            // Unity Job System can only be scheduled from the main thread.
+            var partition = MeshPartitioner.PartitionImmediate(boundedMesh, grid, boundedWeights, allocator);
             try
             {
                 int found = -1;

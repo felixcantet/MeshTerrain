@@ -80,7 +80,9 @@ namespace Fca.MeshTerrain
 
             // 1. Assign each triangle to a box face and emit per-(face,vertex) UV elements.
             //    A vertex used by triangles on multiple faces is duplicated, one copy per face.
-            var faceOfTri = new NativeArray<int>(triCount, Allocator.Temp);
+            //    Managed scratch (not Allocator.Temp) so this runs on the async cook's worker thread —
+            //    Allocator.Temp is not valid on a thread-pool thread (doc/08 §8).
+            var faceOfTri = new int[triCount];
             for (int t = 0; t < triCount; t++)
                 faceOfTri[t] = DominantFace(TriangleNormal(source, t));
 
@@ -168,7 +170,6 @@ namespace Fca.MeshTerrain
             // 5. Compute the domain mapping (resolution + Size3D) from 3D vs UV area.
             mapping = ComputeDomainMapping(dst, settings, packScale);
 
-            faceOfTri.Dispose();
             return dst;
         }
 

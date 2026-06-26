@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using Unity.Burst;
 using Unity.Collections;
 using Unity.Jobs;
@@ -225,6 +226,158 @@ namespace Fca.MeshTerrain
                 Sections = sections,
                 SectionWeights = sectionWeights,
             };
+        }
+
+        /// <summary>
+        /// Job-free, main-thread-independent partition for small meshes (the Phase 5 bounded per-cell build).
+        /// The Unity Job System can only be scheduled from the main thread, so the async cook
+        /// (<c>doc/08 §8</c>) uses this plain-C# path instead of <see cref="Partition"/>. Same result; same
+        /// deterministic centroid assignment. Intended for the tiny single-cell mesh, not whole worlds.
+        /// </summary>
+        public static PartitionResult PartitionImmediate(
+            in MeshData source,
+            in GridSettings grid,
+            WeightLayerSet weights = null,
+            Allocator allocator = Allocator.Persistent)
+        {
+            int triCount = source.TriangleCount;
+
+            ComputeBoundsManaged(source.Vertices, out float3 boundsMin, out float3 boundsMax);
+            var dims = GridDimensions.ComputeGridDimensions(boundsMin, boundsMax, grid);
+            int totalCells = dims.TotalCells;
+
+            // Assign each triangle to its centroid cell (linear index matches GridDimensions.LinearIndex).
+            var triangleCell = new int[triCount];
+            var cellCounts = new int[totalCells];
+            for (int t = 0; t < triCount; t++)
+            {
+                int3 tri = source.Triangles[t];
+                float3 centroid = (source.Vertices[tri.x] + source.Vertices[tri.y] + source.Vertices[tri.z]) / 3f;
+                int3 coord = (int3)math.floor((centroid - dims.SnappedMin) / grid.CellSize);
+                coord = math.clamp(coord, int3.zero, dims.CellNumber - 1);
+                if (grid.Is2D) coord.y = 0;
+                int cell = coord.x + coord.z * dims.CellNumber.x + coord.y * dims.CellNumber.x * dims.CellNumber.z;
+                triangleCell[t] = cell;
+                cellCounts[cell]++;
+            }
+
+            // Compact non-empty cells.
+            int nonEmpty = 0;
+            for (int c = 0; c < totalCells; c++) if (cellCounts[c] > 0) nonEmpty++;
+
+            var sectionCoords = new int3[nonEmpty];
+            var cellToSection = new int[totalCells];
+            int s = 0;
+            for (int c = 0; c < totalCells; c++)
+            {
+                if (cellCounts[c] == 0) { cellToSection[c] = -1; continue; }
+                cellToSection[c] = s;
+                sectionCoords[s] = dims.AbsoluteCoord(dims.LocalCoord(c));
+                s++;
+            }
+
+            var sections = new MeshData[nonEmpty];
+            var remaps = new Dictionary<int, int>[nonEmpty];
+            var localToSource = new List<int>[nonEmpty];
+            for (int i = 0; i < nonEmpty; i++)
+            {
+                remaps[i] = new Dictionary<int, int>();
+                localToSource[i] = new List<int>();
+            }
+
+            // First pass: build triangle lists + vertex remaps per section.
+            var sectionTris = new List<int3>[nonEmpty];
+            var sectionBaseIds = source.HasBaseIDs ? new List<int>[nonEmpty] : null;
+            for (int i = 0; i < nonEmpty; i++)
+            {
+                sectionTris[i] = new List<int3>();
+                if (sectionBaseIds != null) sectionBaseIds[i] = new List<int>();
+            }
+
+            for (int t = 0; t < triCount; t++)
+            {
+                int sec = cellToSection[triangleCell[t]];
+                int3 tri = source.Triangles[t];
+                int a = MapVertexManaged(tri.x, remaps[sec], localToSource[sec]);
+                int b = MapVertexManaged(tri.y, remaps[sec], localToSource[sec]);
+                int c = MapVertexManaged(tri.z, remaps[sec], localToSource[sec]);
+                sectionTris[sec].Add(new int3(a, b, c));
+                if (sectionBaseIds != null) sectionBaseIds[sec].Add(source.BaseIDLayer[t]);
+            }
+
+            // Second pass: allocate + fill each section MeshData.
+            for (int i = 0; i < nonEmpty; i++)
+            {
+                int vCount = localToSource[i].Count;
+                int tCount = sectionTris[i].Count;
+                var section = MeshData.Allocate(vCount, tCount, allocator,
+                    withNormals: source.HasNormals,
+                    withChannelUVs: source.HasChannelUVs,
+                    withSourceUV0: source.HasSourceUV0,
+                    withBaseIDs: source.HasBaseIDs);
+
+                for (int v = 0; v < vCount; v++)
+                {
+                    int src = localToSource[i][v];
+                    section.Vertices[v] = source.Vertices[src];
+                    if (source.HasNormals) section.Normals[v] = source.Normals[src];
+                    if (source.HasChannelUVs) section.ChannelUVs[v] = source.ChannelUVs[src];
+                    if (source.HasSourceUV0) section.SourceUV0[v] = source.SourceUV0[src];
+                }
+                for (int t = 0; t < tCount; t++)
+                {
+                    section.Triangles[t] = sectionTris[i][t];
+                    if (source.HasBaseIDs) section.BaseIDLayer[t] = sectionBaseIds[i][t];
+                }
+                sections[i] = section;
+            }
+
+            // Weight layers (managed side-car).
+            WeightLayerSet[] sectionWeights = null;
+            if (weights != null && weights.LayerCount > 0)
+            {
+                sectionWeights = new WeightLayerSet[nonEmpty];
+                for (int i = 0; i < nonEmpty; i++)
+                {
+                    var result = new WeightLayerSet(allocator);
+                    foreach (var name in weights.LayerNames)
+                    {
+                        if (!weights.TryGetLayer(name, out var srcLayer)) continue;
+                        var dstLayer = result.InitializeLayer(name, localToSource[i].Count);
+                        for (int v = 0; v < localToSource[i].Count; v++)
+                            dstLayer[v] = srcLayer[localToSource[i][v]];
+                    }
+                    sectionWeights[i] = result;
+                }
+            }
+
+            return new PartitionResult
+            {
+                Dims = dims,
+                SectionCoords = sectionCoords,
+                Sections = sections,
+                SectionWeights = sectionWeights,
+            };
+        }
+
+        static int MapVertexManaged(int srcVid, Dictionary<int, int> remap, List<int> localToSource)
+        {
+            if (remap.TryGetValue(srcVid, out int existing)) return existing;
+            int localVid = localToSource.Count;
+            remap.Add(srcVid, localVid);
+            localToSource.Add(srcVid);
+            return localVid;
+        }
+
+        static void ComputeBoundsManaged(NativeArray<float3> vertices, out float3 min, out float3 max)
+        {
+            min = new float3(float.MaxValue);
+            max = new float3(float.MinValue);
+            for (int i = 0; i < vertices.Length; i++)
+            {
+                min = math.min(min, vertices[i]);
+                max = math.max(max, vertices[i]);
+            }
         }
 
         static WeightLayerSet TransferWeights(WeightLayerSet source, NativeArray<int> localToSource, int sectionVertCount, Allocator allocator)

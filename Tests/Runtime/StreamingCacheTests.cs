@@ -18,6 +18,10 @@ namespace Fca.MeshTerrain.Tests
     {
         static List<ModifierComponent> Stack(params ModifierComponent[] mods) => new List<ModifierComponent>(mods);
 
+        // Most cache/key tests don't need the baked LOD chain; keep cooks lean.
+        static readonly LodCookOptions NoLods = new LodCookOptions { BakeLods = false };
+        static readonly LodCookOptions WithLods = LodCookOptions.Default;
+
         const float Eps = 1e-3f;
 
         static (GridSettings grid, GridDimensions dims) MakeGrid(List<ModifierComponent> stack, float cellSize)
@@ -48,8 +52,8 @@ namespace Fca.MeshTerrain.Tests
             var channels = ChannelCookOptions.Default;
             int3 coord = dims.OriginCoord;
 
-            var a = SectionKeyBuilder.Build(stack, grid, dims, coord, 10f, channels);
-            var b = SectionKeyBuilder.Build(stack, grid, dims, coord, 10f, channels);
+            var a = SectionKeyBuilder.Build(stack, grid, dims, coord, 10f, channels, NoLods);
+            var b = SectionKeyBuilder.Build(stack, grid, dims, coord, 10f, channels, NoLods);
 
             Assert.AreEqual(a, b, "Same inputs must yield an equal key.");
             Assert.AreEqual(a.FileStem, b.FileStem, "Same inputs must yield the same disk filename.");
@@ -73,13 +77,13 @@ namespace Fca.MeshTerrain.Tests
             int3 near = dims.OriginCoord;                          // around (-100,-100) corner
             int3 far = dims.OriginCoord + new int3(dims.CellNumber.x - 1, 0, dims.CellNumber.z - 1);
 
-            var nearBefore = SectionKeyBuilder.Build(stack, grid, dims, near, 10f, channels);
-            var farBefore = SectionKeyBuilder.Build(stack, grid, dims, far, 10f, channels);
+            var nearBefore = SectionKeyBuilder.Build(stack, grid, dims, near, 10f, channels, NoLods);
+            var farBefore = SectionKeyBuilder.Build(stack, grid, dims, far, 10f, channels, NoLods);
 
             paint.InnerValue = 0.5f; // edit the paint
 
-            var nearAfter = SectionKeyBuilder.Build(stack, grid, dims, near, 10f, channels);
-            var farAfter = SectionKeyBuilder.Build(stack, grid, dims, far, 10f, channels);
+            var nearAfter = SectionKeyBuilder.Build(stack, grid, dims, near, 10f, channels, NoLods);
+            var farAfter = SectionKeyBuilder.Build(stack, grid, dims, far, 10f, channels, NoLods);
 
             Assert.AreNotEqual(nearBefore.ModifiersHash, nearAfter.ModifiersHash,
                 "Editing a covering modifier must change the covered cell's hash.");
@@ -96,7 +100,7 @@ namespace Fca.MeshTerrain.Tests
             var (grid, dims) = MakeGrid(stack, 100f);
             int3 coord = FirstNonEmptyCoord(stack, grid, dims);
 
-            var cooked = SectionCooker.Cook(stack, grid, dims, coord, 10f, ChannelCookOptions.Default, float4x4.identity, Allocator.TempJob);
+            var cooked = SectionCooker.Cook(stack, grid, dims, coord, 10f, ChannelCookOptions.Default, WithLods, float4x4.identity, Allocator.TempJob);
             CookedSection restored = null;
             try
             {
@@ -104,6 +108,24 @@ namespace Fca.MeshTerrain.Tests
                 SectionBlob.Write(ms, cooked);
                 ms.Position = 0;
                 Assert.IsTrue(SectionBlob.TryRead(ms, Allocator.TempJob, out restored), "Blob must read back.");
+
+                // The baked LOD chain must round-trip too.
+                Assert.IsTrue(cooked.HasBakedLods, "Cook with WithLods must bake LODs.");
+                Assert.IsTrue(restored.HasBakedLods, "Baked LODs must survive the blob round-trip.");
+                Assert.AreEqual(cooked.Lods.Length, restored.Lods.Length);
+                for (int l = 0; l < cooked.Lods.Length; l++)
+                {
+                    Assert.AreEqual(cooked.Lods[l].Mesh.VertexCount, restored.Lods[l].Mesh.VertexCount, $"LOD{l} vertex count");
+                    Assert.AreEqual(cooked.Lods[l].Mesh.TriangleCount, restored.Lods[l].Mesh.TriangleCount, $"LOD{l} triangle count");
+                }
+
+                // Baked collision mesh must round-trip too.
+                Assert.AreEqual(cooked.HasBakedCollision, restored.HasBakedCollision, "Collision presence must match.");
+                if (cooked.HasBakedCollision)
+                {
+                    Assert.AreEqual(cooked.CollisionMesh.VertexCount, restored.CollisionMesh.VertexCount, "Collision vertex count");
+                    Assert.AreEqual(cooked.CollisionMesh.TriangleCount, restored.CollisionMesh.TriangleCount, "Collision triangle count");
+                }
 
                 Assert.AreEqual(cooked.Coord, restored.Coord);
                 Assert.AreEqual(cooked.Key, restored.Key, "Key must survive the round-trip.");
@@ -140,7 +162,7 @@ namespace Fca.MeshTerrain.Tests
             int3 coord = FirstNonEmptyCoord(stack, grid, dims);
             var channels = new ChannelCookOptions { Generate = true, TexelSize3D = 100f, GutterFill = true };
 
-            var cooked = SectionCooker.Cook(stack, grid, dims, coord, 10f, channels, float4x4.identity, Allocator.TempJob);
+            var cooked = SectionCooker.Cook(stack, grid, dims, coord, 10f, channels, NoLods, float4x4.identity, Allocator.TempJob);
             CookedSection restored = null;
             try
             {
@@ -162,6 +184,33 @@ namespace Fca.MeshTerrain.Tests
             finally { cooked.Dispose(); restored?.Dispose(); }
         }
 
+        [Test]
+        public void Cook_BakesLodChainOnWorker_WithDecreasingTriangleCounts()
+        {
+            var stack = SampleStack();
+            var (grid, dims) = MakeGrid(stack, 100f);
+            int3 coord = FirstNonEmptyCoord(stack, grid, dims);
+
+            var cooked = SectionCooker.Cook(stack, grid, dims, coord, 10f, ChannelCookOptions.Default, WithLods, float4x4.identity, Allocator.TempJob);
+            try
+            {
+                Assert.IsTrue(cooked.HasBakedLods, "Cook must bake the LOD chain.");
+                Assert.AreEqual(WithLods.Qualities.Length, cooked.Lods.Length, "One mesh per quality.");
+
+                // LODs must actually simplify: each subsequent LOD has fewer (or equal) triangles than LOD0.
+                int lod0Tris = cooked.Lods[0].Mesh.TriangleCount;
+                Assert.Greater(lod0Tris, 0);
+                for (int l = 1; l < cooked.Lods.Length; l++)
+                    Assert.Less(cooked.Lods[l].Mesh.TriangleCount, lod0Tris, $"LOD{l} must be simpler than LOD0.");
+
+                // Weights are carried through simplification (attribute-aware) for material channels.
+                if (cooked.Weights != null && cooked.Weights.LayerCount > 0)
+                    for (int l = 0; l < cooked.Lods.Length; l++)
+                        Assert.IsNotNull(cooked.Lods[l].Weights, $"LOD{l} must keep its weight side-car.");
+            }
+            finally { cooked.Dispose(); }
+        }
+
         // ---- Cache ----
 
         [Test]
@@ -176,14 +225,14 @@ namespace Fca.MeshTerrain.Tests
             var cache = new SectionCache("test", ramCapacity: 16, overrideDir: dir, allocator: Allocator.TempJob);
             try
             {
-                var key = SectionKeyBuilder.Build(stack, grid, dims, coord, 10f, channels);
+                var key = SectionKeyBuilder.Build(stack, grid, dims, coord, 10f, channels, NoLods);
 
                 int cooks = 0;
                 CookedSection GetOrCook()
                 {
                     if (cache.TryGet(key, out var hit)) return hit;
                     cooks++;
-                    var cooked = SectionCooker.Cook(stack, grid, dims, coord, 10f, channels, float4x4.identity, Allocator.TempJob);
+                    var cooked = SectionCooker.Cook(stack, grid, dims, coord, 10f, channels, NoLods, float4x4.identity, Allocator.TempJob);
                     cache.Put(key, cooked);
                     return cooked;
                 }
@@ -224,10 +273,10 @@ namespace Fca.MeshTerrain.Tests
                 int cooks = 0;
                 void GetOrCook()
                 {
-                    var key = SectionKeyBuilder.Build(stack, grid, dims, coord, 10f, channels);
+                    var key = SectionKeyBuilder.Build(stack, grid, dims, coord, 10f, channels, NoLods);
                     if (cache.TryGet(key, out _)) return;
                     cooks++;
-                    var cooked = SectionCooker.Cook(stack, grid, dims, coord, 10f, channels, float4x4.identity, Allocator.TempJob);
+                    var cooked = SectionCooker.Cook(stack, grid, dims, coord, 10f, channels, NoLods, float4x4.identity, Allocator.TempJob);
                     cache.Put(key, cooked);
                 }
 

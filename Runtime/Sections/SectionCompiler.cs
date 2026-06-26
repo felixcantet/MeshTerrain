@@ -53,6 +53,13 @@ namespace Fca.MeshTerrain
         public float[] LODScreenRelativeTransitionHeights = { 0.6f, 0.3f, 0.1f };
         public MeshSkirtSettings Skirt = MeshSkirtSettings.DefaultForCellSize(100f);
 
+        /// <summary>
+        /// Simplification quality of the streaming collision mesh (1 = full-res, lower = far cheaper PhysX
+        /// cook). The collision mesh is baked unskirted on the cook's worker thread; the present only uploads
+        /// + bakes PhysX. The full-res PhysX bake + upload was ~13 ms/section in streaming (doc/08 §8).
+        /// </summary>
+        public float CollisionQuality = 0.25f;
+
         // --- Phase 4: channel texture atlas ---
 
         /// <summary>Generate channel UVs, rasterize the weight layers into an atlas, and bind it per renderer.</summary>
@@ -183,6 +190,8 @@ namespace Fca.MeshTerrain
             MeshData renderData = default;
             WeightLayerSet renderWeights = null;
 
+            var _sw = System.Diagnostics.Stopwatch.StartNew();
+            double _t0 = 0;
             try
             {
                 if (settings.GenerateChannels)
@@ -204,6 +213,7 @@ namespace Fca.MeshTerrain
                     raster ??= ChannelRasterizerCPU.Render(
                         channelSection, channelWeights, mapping, settings.ChannelGutterFill);
                     compiled.ChannelTexture = raster.Texture;
+                    _t0 = Lap(_sw, "compile.channels", ref _t0);
                 }
 
                 bool hasSkirt = settings.Skirt.Enabled;
@@ -216,9 +226,13 @@ namespace Fca.MeshTerrain
                     renderData = CopyMeshData(baseRenderSection, Allocator.TempJob);
                     renderWeights = CopyWeights(baseRenderWeights, baseRenderSection.VertexCount, Allocator.TempJob);
                 }
+                _t0 = Lap(_sw, "compile.skirt", ref _t0);
 
                 compiled.RenderMeshes = BuildRenderLODs(renderData, renderWeights, settings, compiled);
+                _t0 = Lap(_sw, "compile.lods", ref _t0);
+
                 BuildRenderObjects(root.transform, compiled.RenderMeshes, settings);
+                _t0 = Lap(_sw, "compile.renderObjects", ref _t0);
 
                 if (raster != null)
                     foreach (var renderer in root.GetComponentsInChildren<MeshRenderer>())
@@ -229,6 +243,7 @@ namespace Fca.MeshTerrain
                     compiled.CollisionMesh = collisionMesh;
                     compiled.Own(collisionMesh);
                     root.AddComponent<MeshCollider>().sharedMesh = collisionMesh;
+                    _t0 = Lap(_sw, "compile.collider", ref _t0);
                 }
             }
             finally
@@ -243,6 +258,95 @@ namespace Fca.MeshTerrain
             return compiled;
         }
 
+        /// <summary>
+        /// Thread-safe skirt build (a public entry to the internal builder) so the cook can apply the skirt on
+        /// a worker thread before baking LODs. Pure <see cref="MeshData"/> work; caller owns the result.
+        /// </summary>
+        public static MeshData BuildSkirt(in MeshData source, WeightLayerSet weights, MeshSkirtSettings settings,
+            Allocator allocator, out WeightLayerSet resultWeights)
+            => MeshSkirtBuilder.Build(source, weights, settings, allocator, out resultWeights);
+
+        /// <summary>
+        /// Upload-only compile from <b>prebaked</b> LODs (skirt + simplification already done on the cook's
+        /// worker thread). This is the streaming fast path: it does no skirt/simplify on the main thread —
+        /// only mesh upload + component creation + collider — so the present cost is the cheap part the
+        /// profiler measured (doc/08 §8). <paramref name="collisionSource"/> is the unskirted/unsimplified
+        /// cooked mesh.
+        /// </summary>
+        public static CompiledSection CompilePrebaked(
+            Streaming.LodMesh[] lods,
+            in MeshData collisionSource,
+            in GridDimensions dims,
+            int3 coord,
+            SectionCompilationSettings settings,
+            Transform parent = null)
+        {
+            settings ??= new SectionCompilationSettings();
+            if (lods == null || lods.Length == 0)
+                throw new ArgumentException("CompilePrebaked requires at least one baked LOD.");
+
+            var _sw = System.Diagnostics.Stopwatch.StartNew();
+            double _t = 0;
+
+            float3 origin = SectionOrigin(dims, coord);
+            var compiled = new CompiledSection { Coord = coord };
+            var root = new GameObject($"Section_{coord.x}_{coord.y}_{coord.z}") { hideFlags = HideFlags.DontSave };
+            root.transform.SetParent(parent, false);
+            root.transform.localPosition = (Vector3)origin;
+            compiled.Root = root;
+            _t = Lap(_sw, "pre.rootGO", ref _t);
+
+            // Collision from the prebaked (cook-side, unskirted, simplified) collision mesh — upload + PhysX
+            // bake only, no main-thread simplify. (doc/08 §8 perf pass.)
+            if (settings.GenerateCollision && collisionSource.Vertices.IsCreated && collisionSource.TriangleCount > 0)
+            {
+                MeshData localCollision = CopyWithOffset(collisionSource, origin, Allocator.TempJob);
+                try
+                {
+                    var collisionMesh = MeshDataConversions.ToCollisionMesh(localCollision, root.name + "_Collision");
+                    compiled.CollisionMesh = collisionMesh;
+                    compiled.Own(collisionMesh);
+                    _t = Lap(_sw, "pre.collisionMesh", ref _t);
+                    root.AddComponent<MeshCollider>().sharedMesh = collisionMesh;
+                    _t = Lap(_sw, "pre.colliderBake", ref _t);
+                }
+                finally { localCollision.Dispose(); }
+            }
+
+            // Upload each prebaked LOD (offsetting verts to section-local; packing weights into UV2-7).
+            var meshes = new Mesh[lods.Length];
+            for (int i = 0; i < lods.Length; i++)
+            {
+                MeshData local = CopyWithOffset(lods[i].Mesh, origin, Allocator.TempJob);
+                try
+                {
+                    Mesh m = MeshDataConversions.ToRenderMesh(local, $"LOD{i}");
+                    _t = Lap(_sw, "pre.uploadMesh", ref _t);
+                    PackWeightLayers(m, lods[i].Weights);
+                    _t = Lap(_sw, "pre.packWeights", ref _t);
+                    compiled.Own(m);
+                    meshes[i] = m;
+                }
+                finally { local.Dispose(); }
+            }
+            compiled.RenderMeshes = meshes;
+            _t = Lap(_sw, "pre.lodCopy+dispose", ref _t);
+
+            BuildRenderObjects(root.transform, meshes, settings);
+            _t = Lap(_sw, "pre.renderObjects", ref _t);
+
+            return compiled;
+        }
+
+        /// <summary>Records the time since the previous lap point into <paramref name="phase"/> and returns the
+        /// new cumulative elapsed. No-op cost beyond a stopwatch read when profiling is disabled.</summary>
+        static double Lap(System.Diagnostics.Stopwatch sw, string phase, ref double prevTotal)
+        {
+            double now = sw.Elapsed.TotalMilliseconds;
+            Streaming.StreamingProfiler.AddPhase(phase, now - prevTotal);
+            return now;
+        }
+
         public static float3 SectionOrigin(in GridDimensions dims, int3 absoluteCoord)
         {
             int3 local = absoluteCoord - dims.OriginCoord;
@@ -255,9 +359,11 @@ namespace Fca.MeshTerrain
             SectionCompilationSettings settings,
             CompiledSection owner)
         {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
             Mesh lod0 = MeshDataConversions.ToRenderMesh(renderData, "LOD0");
             PackWeightLayers(lod0, weights);
             owner.Own(lod0);
+            Streaming.StreamingProfiler.AddPhase("lods.upload+pack", sw.Elapsed.TotalMilliseconds); sw.Restart();
 
             float[] qualities = settings.GenerateLODs && settings.LODQualities != null && settings.LODQualities.Length > 0
                 ? settings.LODQualities
@@ -272,6 +378,7 @@ namespace Fca.MeshTerrain
                 meshes[i] = simplified;
                 owner.Own(simplified);
             }
+            Streaming.StreamingProfiler.AddPhase("lods.simplify", sw.Elapsed.TotalMilliseconds);
 
             return meshes;
         }

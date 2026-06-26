@@ -90,7 +90,7 @@ namespace Fca.MeshTerrain.Streaming
         /// Bump when the cook pipeline's <b>implementation</b> changes in a way that alters output for the
         /// same params (e.g. partition/skirt/channel code). Mirrors UE <c>MegaMeshClassVersion</c>.
         /// </summary>
-        public const int ClassVersion = 1;
+        public const int ClassVersion = 2; // bumped: blob now carries baked LOD chain (doc/08 §8)
 
         /// <summary>Class-version hash (folded into every key; a bump invalidates the whole cache).</summary>
         public static Hash128 ClassHash()
@@ -119,7 +119,7 @@ namespace Fca.MeshTerrain.Streaming
         /// <c>Is2D</c>/anchor) and the channel-cook flags. LOD/skirt settings live in the presenter
         /// (Phase 5.2/5.3); extend this when they affect the <b>cooked</b> bytes.
         /// </summary>
-        public static Hash128 VariantHash(in GridSettings grid, in ChannelCookOptions channels)
+        public static Hash128 VariantHash(in GridSettings grid, in ChannelCookOptions channels, in LodCookOptions lod)
         {
             var h = new Hash128();
             h.Append(grid.CellSize);
@@ -128,6 +128,15 @@ namespace Fca.MeshTerrain.Streaming
             h.Append(channels.Generate ? 1 : 0);
             h.Append(channels.TexelSize3D);
             h.Append(channels.GutterFill ? 1 : 0);
+
+            // LOD baking affects the cooked bytes (the blob now carries baked LODs).
+            h.Append(lod.BakeLods ? 1 : 0);
+            if (lod.Qualities != null)
+                foreach (var q in lod.Qualities) h.Append(q);
+            h.Append(lod.Skirt.Enabled ? 1 : 0);
+            h.Append(lod.Skirt.Width);
+            h.Append(lod.Skirt.PushDown);
+            h.Append((int)lod.Skirt.PushMethod);
             return h;
         }
 
@@ -167,13 +176,13 @@ namespace Fca.MeshTerrain.Streaming
         /// <summary>Builds the full key for <paramref name="coord"/>.</summary>
         public static SectionKey Build(
             IReadOnlyList<ModifierComponent> stack, in GridSettings grid, in GridDimensions dims,
-            int3 coord, float cellMargin, in ChannelCookOptions channels)
+            int3 coord, float cellMargin, in ChannelCookOptions channels, in LodCookOptions lod)
         {
             return new SectionKey(
                 coord,
                 ModifiersHashForCell(stack, dims, coord, cellMargin, grid.Is2D),
                 ModifierSetHash(stack),
-                VariantHash(grid, channels),
+                VariantHash(grid, channels, lod),
                 ClassHash());
         }
 
