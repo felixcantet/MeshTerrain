@@ -36,6 +36,13 @@ namespace Fca.MeshTerrain
             };
     }
 
+    /// <summary>Which backend rasterizes the channel atlas. Phase 4a honors CPU; GPU lands in 4b.</summary>
+    public enum ChannelRasterizerBackend
+    {
+        CPU,
+        Compute,
+    }
+
     [Serializable]
     public sealed class SectionCompilationSettings
     {
@@ -46,14 +53,26 @@ namespace Fca.MeshTerrain
         public float[] LODScreenRelativeTransitionHeights = { 0.6f, 0.3f, 0.1f };
         public MeshSkirtSettings Skirt = MeshSkirtSettings.DefaultForCellSize(100f);
 
+        // --- Phase 4: channel texture atlas ---
+
+        /// <summary>Generate channel UVs, rasterize the weight layers into an atlas, and bind it per renderer.</summary>
+        public bool GenerateChannels = false;
+        public ChannelUVSettings ChannelUVSettings = ChannelUVSettings.Default;
+        public ChannelRasterizerBackend ChannelRasterizer = ChannelRasterizerBackend.CPU;
+        /// <summary>Whether to run the pull-push gutter fill (the border fill always runs).</summary>
+        public bool ChannelGutterFill = true;
+
         public static SectionCompilationSettings FromDefinition(MeshPartitionDefinition definition)
         {
             float cellSize = definition != null ? definition.CellSize : 100f;
-            return new SectionCompilationSettings
+            var settings = new SectionCompilationSettings
             {
                 Material = definition != null ? definition.Material : null,
                 Skirt = MeshSkirtSettings.DefaultForCellSize(cellSize),
             };
+            if (definition != null)
+                settings.ChannelUVSettings.TexelSize3D = definition.ChannelTexelSize;
+            return settings;
         }
     }
 
@@ -65,6 +84,9 @@ namespace Fca.MeshTerrain
         public int3 Coord { get; internal set; }
         public Mesh[] RenderMeshes { get; internal set; }
         public Mesh CollisionMesh { get; internal set; }
+
+        /// <summary>The rasterized channel atlas (Phase 4), or null when channels were not generated.</summary>
+        public Texture ChannelTexture { get; internal set; }
 
         internal void Own(Mesh mesh)
         {
@@ -80,10 +102,14 @@ namespace Fca.MeshTerrain
             foreach (var mesh in _ownedMeshes)
                 DestroyObject(mesh);
 
+            if (ChannelTexture != null)
+                DestroyObject(ChannelTexture);
+
             _ownedMeshes.Clear();
             Root = null;
             RenderMeshes = null;
             CollisionMesh = null;
+            ChannelTexture = null;
         }
 
         static void DestroyObject(UnityEngine.Object obj)
@@ -139,28 +165,62 @@ namespace Fca.MeshTerrain
             compiled.Root = root;
 
             MeshData localSection = CopyWithOffset(section, origin, Allocator.TempJob);
+
+            // Channel generation (Phase 4) runs before skirt/LOD so the generated ChannelUVs ride
+            // through the copy/skirt/pack paths (which already carry ChannelUVs). It produces a
+            // fresh, UV-seam-split mesh + remapped weights used for rendering; collision keeps the
+            // original unsplit localSection. The collision mesh is built up-front for that reason.
+            Mesh collisionMesh = null;
+            if (settings.GenerateCollision)
+                collisionMesh = MeshDataConversions.ToCollisionMesh(localSection, root.name + "_Collision");
+
+            MeshData baseRenderSection = localSection;
+            WeightLayerSet baseRenderWeights = weights;
+            MeshData channelSection = default;
+            WeightLayerSet channelWeights = null;
+            ChannelRasterResult raster = null;
+
             MeshData renderData = default;
             WeightLayerSet renderWeights = null;
 
             try
             {
+                if (settings.GenerateChannels)
+                {
+                    channelSection = ChannelUVUnwrap.Generate(
+                        localSection, weights, settings.ChannelUVSettings, Allocator.TempJob,
+                        out channelWeights, out var mapping);
+                    baseRenderSection = channelSection;
+                    baseRenderWeights = channelWeights;
+
+                    if (settings.ChannelRasterizer != ChannelRasterizerBackend.CPU)
+                        Debug.LogWarning("Compute channel rasterizer is not available yet (Phase 4b); using CPU backend.");
+
+                    raster = ChannelRasterizerCPU.Render(
+                        channelSection, channelWeights, mapping, settings.ChannelGutterFill);
+                    compiled.ChannelTexture = raster.Texture;
+                }
+
                 bool hasSkirt = settings.Skirt.Enabled;
                 if (hasSkirt)
                 {
-                    renderData = MeshSkirtBuilder.Build(localSection, weights, settings.Skirt, Allocator.TempJob, out renderWeights);
+                    renderData = MeshSkirtBuilder.Build(baseRenderSection, baseRenderWeights, settings.Skirt, Allocator.TempJob, out renderWeights);
                 }
                 else
                 {
-                    renderData = CopyMeshData(localSection, Allocator.TempJob);
-                    renderWeights = CopyWeights(weights, localSection.VertexCount, Allocator.TempJob);
+                    renderData = CopyMeshData(baseRenderSection, Allocator.TempJob);
+                    renderWeights = CopyWeights(baseRenderWeights, baseRenderSection.VertexCount, Allocator.TempJob);
                 }
 
                 compiled.RenderMeshes = BuildRenderLODs(renderData, renderWeights, settings, compiled);
                 BuildRenderObjects(root.transform, compiled.RenderMeshes, settings);
 
-                if (settings.GenerateCollision)
+                if (raster != null)
+                    foreach (var renderer in root.GetComponentsInChildren<MeshRenderer>())
+                        ChannelPacking.ApplyToRenderer(renderer, raster.Texture, raster.Table, raster.TexcoordMetrics);
+
+                if (collisionMesh != null)
                 {
-                    Mesh collisionMesh = MeshDataConversions.ToCollisionMesh(localSection, root.name + "_Collision");
                     compiled.CollisionMesh = collisionMesh;
                     compiled.Own(collisionMesh);
                     root.AddComponent<MeshCollider>().sharedMesh = collisionMesh;
@@ -168,6 +228,8 @@ namespace Fca.MeshTerrain
             }
             finally
             {
+                if (channelWeights != null) channelWeights.Dispose();
+                if (channelSection.Vertices.IsCreated) channelSection.Dispose();
                 if (renderWeights != null) renderWeights.Dispose();
                 if (renderData.Vertices.IsCreated) renderData.Dispose();
                 localSection.Dispose();
