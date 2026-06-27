@@ -224,5 +224,102 @@ namespace Fca.MeshTerrain.Tests
                 try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch { }
             }
         }
+
+        // ---- Phase 6: scene-object modifier assembly ----
+
+        // Builds a streamer that assembles its stack from child ModifierBehaviour wrappers (no SetModifierStack,
+        // so UseSceneModifiers drives collection). Returns the streamer + the spawned wrappers + cleanup data.
+        static (MeshTerrainStreamer s, GameObject go, MeshPartitionDefinition def, string dir) MakeSceneStreamer()
+        {
+            string dir = Path.Combine(Path.GetTempPath(), "MeshTerrainSceneTest_" + System.Guid.NewGuid().ToString("N"));
+            var go = new GameObject("SceneStreamerTest");
+            go.SetActive(false);
+            var s = go.AddComponent<MeshTerrainStreamer>();
+            s.WorldOriginOffset = Vector3.zero; s.WorldHeight = 4000f;
+            s.LoadDistance = 250f; s.UnloadDistance = 350f; s.MaxConcurrentCooks = 4; s.MaxMillisPerFrame = 1000f;
+            s.GenerateChannels = false; s.RamCapacity = 64; s.CacheDirOverride = dir;
+            s.UseSceneModifiers = true;
+            var def = ScriptableObject.CreateInstance<MeshPartitionDefinition>();
+            def.name = "SceneStreamerTestDef"; def.CellSize = 100; def.Is2D = true;
+            s.Definition = def;
+            return (s, go, def, dir);
+        }
+
+        static T AddChildWrapper<T>(GameObject parent) where T : ModifierBehaviour
+        {
+            var child = new GameObject(typeof(T).Name);
+            child.transform.SetParent(parent.transform, false);
+            return child.AddComponent<T>();
+        }
+
+        [Test]
+        public void SceneStack_AssemblesBaseFirstThenByPriority()
+        {
+            var (s, go, def, dir) = MakeSceneStreamer();
+            try
+            {
+                // Add non-base wrappers BEFORE the base, and out of priority order, to prove the sort.
+                var paintHi = AddChildWrapper<WeightUtilityModifierBehaviour>(go);
+                paintHi.WeightChannelName = "B"; paintHi.SubPriority = 10;
+                var paintLo = AddChildWrapper<WeightUtilityModifierBehaviour>(go);
+                paintLo.WeightChannelName = "A"; paintLo.SubPriority = 1;
+                var rect = AddChildWrapper<RectangleBaseModifierBehaviour>(go);
+                rect.Size = new Vector2(400, 400); rect.Resolution = new Vector2Int(40, 40);
+
+                go.SetActive(true); // OnEnable -> EnsureInitialized -> CollectSceneModifiers
+
+                var stack = s.ModifierStack;
+                Assert.AreEqual(3, stack.Count);
+                Assert.IsTrue(stack[0] is RectangleBaseModifier, "base must sort first");
+                Assert.IsTrue(stack[0].IsBase);
+                // Then by ascending SubPriority: paintLo (1) before paintHi (10).
+                Assert.AreEqual("A", ((WeightUtilityModifier)stack[1]).WeightChannelName);
+                Assert.AreEqual("B", ((WeightUtilityModifier)stack[2]).WeightChannelName);
+            }
+            finally
+            {
+                Object.DestroyImmediate(go);
+                Object.DestroyImmediate(def);
+                try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch { }
+            }
+        }
+
+        [Test]
+        public void EditingSceneWrapper_ReCooksCoveredCells()
+        {
+            StreamingDiagnostics.Reset();
+            var (s, go, def, dir) = MakeSceneStreamer();
+            try
+            {
+                var rect = AddChildWrapper<RectangleBaseModifierBehaviour>(go);
+                rect.Size = new Vector2(400, 400); rect.Resolution = new Vector2Int(40, 40);
+                var paint = AddChildWrapper<WeightUtilityModifierBehaviour>(go);
+                paint.WeightChannelName = "Grass"; paint.Radius = 1000; paint.Falloff = 1;
+                paint.InnerValue = 1; paint.OuterValue = 1;
+
+                go.SetActive(true);
+
+                int3 coord = new int3(0, 0, 0);
+                s.ForceLoad(coord);
+                int cooksAfterFirst = StreamingDiagnostics.Cooks;
+                Assert.GreaterOrEqual(cooksAfterFirst, 1);
+
+                // Edit a covering wrapper field and notify (mirrors the inspector auto-rebuild path).
+                paint.InnerValue = 0.25f;
+                paint.MarkDirty();
+                s.NotifyModifierEdited(paint);
+                s.ForceLoad(coord);
+
+                Assert.AreEqual(cooksAfterFirst + 1, StreamingDiagnostics.Cooks,
+                    "Editing a covering scene wrapper must re-cook the covered cell.");
+                s.ForceUnloadAll();
+            }
+            finally
+            {
+                Object.DestroyImmediate(go);
+                Object.DestroyImmediate(def);
+                try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch { }
+            }
+        }
     }
 }

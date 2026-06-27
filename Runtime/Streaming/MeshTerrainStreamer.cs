@@ -62,6 +62,11 @@ namespace Fca.MeshTerrain.Streaming
         [Tooltip("Optional override for the cache directory (else persistentDataPath/MeshTerrain/<id>).")]
         public string CacheDirOverride = "";
 
+        [Header("Modifiers")]
+        [Tooltip("Assemble the modifier stack from child ModifierBehaviour components (UE-style scene " +
+                 "authoring). When off, the stack is supplied in code via SetModifierStack (tests/demo).")]
+        public bool UseSceneModifiers = true;
+
         // --- runtime state ---
         GridSettings _grid;
         GridDimensions _dims;
@@ -72,6 +77,10 @@ namespace Fca.MeshTerrain.Streaming
         SectionCache _cache;
         ISectionPresenter _presenter;
         readonly List<ModifierComponent> _stack = new();
+        // True once SetModifierStack supplied a code stack — that overrides scene collection (tests/demo).
+        bool _codeStackOverride;
+        // Scene wrappers backing the current scene-assembled stack (parallel to _stack); empty for a code stack.
+        readonly List<ModifierBehaviour> _sceneWrappers = new();
 
         readonly Dictionary<int3, ResidentSection> _resident = new();
         readonly HashSet<int3> _desired = new();
@@ -106,6 +115,8 @@ namespace Fca.MeshTerrain.Streaming
         public double lastFinalizeMs => _lastFinalizeMs;
         public int lastFinalizedCount => _lastFinalizedCount;
         public ISectionCache Cache => _cache;
+        /// <summary>The assembled modifier stack in applied order (read-only; diagnostics / tests).</summary>
+        public IReadOnlyList<ModifierComponent> ModifierStack => _stack;
 
         /// <summary>A full profiler dump (phase table + slowest recent sections). Requires
         /// <see cref="StreamingProfiler.Enabled"/>. Hook this to a key/button to copy out the analytics.</summary>
@@ -132,7 +143,9 @@ namespace Fca.MeshTerrain.Streaming
         public void SetModifierStack(IReadOnlyList<ModifierComponent> stack)
         {
             _stack.Clear();
+            _sceneWrappers.Clear();
             if (stack != null) _stack.AddRange(stack);
+            _codeStackOverride = true; // a code stack wins over scene collection until cleared
             if (_initialized) ForceUnloadAll();
         }
 
@@ -227,6 +240,52 @@ namespace Fca.MeshTerrain.Streaming
 
             _initialized = true;
             _hasLastFocus = false;
+
+            // Assemble the stack from scene wrappers unless a code stack was supplied (tests/demo).
+            if (UseSceneModifiers && !_codeStackOverride)
+                CollectSceneModifiers();
+        }
+
+        /// <summary>
+        /// The streaming grid's origin frame in world space. The cooker runs with <c>meshToWorld = identity</c>,
+        /// so a modifier's mesh-local frame == this grid frame (anchored at <see cref="WorldOriginOffset"/>,
+        /// oriented/scaled by this streamer's transform). Scene wrappers express their placement relative to it.
+        /// </summary>
+        float4x4 GridToWorld()
+            => math.mul((float4x4)transform.localToWorldMatrix,
+                        float4x4.Translate((float3)WorldOriginOffset));
+
+        /// <summary>
+        /// Rebuilds <see cref="_stack"/> from child <see cref="ModifierBehaviour"/>s, sorted base-first then by
+        /// priority layer / sub-priority / sibling index (UE base-first + type/sub-priority + path tiebreak).
+        /// No-op when a code stack overrides (tests/demo) or scene authoring is disabled.
+        /// </summary>
+        public void CollectSceneModifiers()
+        {
+            if (_codeStackOverride || !UseSceneModifiers) return;
+
+            _sceneWrappers.Clear();
+            GetComponentsInChildren<ModifierBehaviour>(true, _sceneWrappers); // includeInactive: disabled GOs still author
+
+            // Deterministic apply order: bases first, then PriorityLayer, then SubPriority, then sibling order.
+            _sceneWrappers.Sort((a, b) =>
+            {
+                if (a.IsBaseModifier != b.IsBaseModifier) return a.IsBaseModifier ? -1 : 1;
+                int p = a.PriorityLayer.CompareTo(b.PriorityLayer);
+                if (p != 0) return p;
+                int s = a.SubPriority.CompareTo(b.SubPriority);
+                if (s != 0) return s;
+                return a.transform.GetSiblingIndex().CompareTo(b.transform.GetSiblingIndex());
+            });
+
+            float4x4 gridToWorld = GridToWorld();
+            _stack.Clear();
+            foreach (var w in _sceneWrappers)
+            {
+                if (w == null) continue;
+                w.MarkDirty(); // pick up any transform/field change since the last build
+                _stack.Add(w.GetCore(gridToWorld));
+            }
         }
 
         void Update()
@@ -557,6 +616,43 @@ namespace Fca.MeshTerrain.Streaming
                 Evict(coord);              // next refocus re-loads with the new key -> miss -> re-cook
             _unloadScratch.Clear();
             _hasLastFocus = false;         // force a re-resolve next tick
+        }
+
+        /// <summary>
+        /// A single scene modifier's params/transform changed: re-cook only the cells it covered (old footprint)
+        /// and now covers (new footprint). Mirrors UE <c>PostEditChangeProperty</c>/<c>PostEditComponentMove</c>
+        /// → <c>OnChanged(bounds)</c> — scoped, incremental. No-op for a code stack / disabled scene authoring.
+        /// </summary>
+        public void NotifyModifierEdited(ModifierBehaviour wrapper)
+        {
+            if (!_initialized || wrapper == null || _codeStackOverride || !UseSceneModifiers) return;
+
+            // Membership change (added/removed since last collect) → full re-resolve.
+            int idx = _sceneWrappers.IndexOf(wrapper);
+            if (idx < 0 || idx >= _stack.Count) { NotifyModifierStackChanged(); return; }
+
+            // Invalidate the OLD footprint from the core still in the stack (built at the previous collect, so it
+            // reflects the pre-edit bounds even though OnValidate already marked the wrapper dirty).
+            InvalidateModifier(_stack[idx]);
+
+            // Re-collect (rebuilds dirty wrapper cores from new fields/transform), then invalidate the NEW footprint.
+            CollectSceneModifiers();
+            int newIdx = _sceneWrappers.IndexOf(wrapper);
+            if (newIdx >= 0 && newIdx < _stack.Count)
+                InvalidateModifier(_stack[newIdx]);
+        }
+
+        /// <summary>
+        /// Stack membership or ordering changed (modifier added/removed/reordered/enable toggled). Re-collect
+        /// and hard-reset residency so the whole world re-resolves against the new stack (matches
+        /// <see cref="SetModifierStack"/> semantics). Cheap: presentation is cache-backed.
+        /// </summary>
+        public void NotifyModifierStackChanged()
+        {
+            if (!_initialized || _codeStackOverride || !UseSceneModifiers) return;
+            CollectSceneModifiers();
+            ForceUnloadAll();
+            _hasLastFocus = false;
         }
 
         void Teardown()
