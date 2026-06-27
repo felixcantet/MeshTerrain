@@ -91,9 +91,16 @@ namespace Fca.MeshTerrain.Demo
         public PresenterBackend presenterBackend = PresenterBackend.GameObject;
         [Tooltip("Flat instanced material for the BRG backend (uses 'Mesh Terrain/Instanced Flat' if unset).")]
         public Material instancedMaterial;
+        [Tooltip("BRG shared-atlas resolution. >0 enables shared-atlas instanced channels (all sections one " +
+                 "material -> draws stop scaling with section count). Must be a fixed size. 0 = flat (no channels).")]
+        public int brgAtlasResolution = 256;
+        [Tooltip("Max slices in the BRG shared channel atlas (sections * channels).")]
+        public int brgAtlasCapacity = 1024;
+        [Tooltip("BRG debug: force LOD0 for all sections (isolates whether LOD simplification corrupts channel UVs).")]
+        public bool brgForceLod0 = false;
         [Tooltip("BRG backend: tint each tile by its selected LOD (green=LOD0, yellow=LOD1, red=LOD2+) so " +
-                 "LOD selection is visible (BRG draws don't show in Scene wireframe).")]
-        public bool debugLodColors = true;
+                 "LOD selection is visible (BRG draws don't show in Scene wireframe). Off = channel blend.")]
+        public bool debugLodColors = false;
 
         // Tracked so we can fully tear down between rebuilds. Meshes are tracked separately because
         // destroying a GameObject does NOT free the Mesh it referenced — that was the "old meshes still
@@ -336,7 +343,10 @@ namespace Fca.MeshTerrain.Demo
         {
             // Spawn (or reuse) a streamer on a child GO and drive it with a code-supplied modifier stack.
             // Streaming itself runs in Play mode (the streamer's Update). In edit mode this just configures it.
+            // Build the GO INACTIVE so the streamer's OnEnable (which caches cook options incl. the fixed
+            // atlas resolution) doesn't fire until all fields below are set. Activated at the end.
             var go = new GameObject("MeshTerrainStreamer") { hideFlags = HideFlags.DontSave };
+            go.SetActive(false);
             go.transform.SetParent(transform, false);
             _spawned.Add(go);
 
@@ -350,6 +360,10 @@ namespace Fca.MeshTerrain.Demo
             _streamer.MaxPresentsPerFrame = maxPresentsPerFrame;
             _streamer.MaxMillisPerFrame = maxMillisPerFrame;
             _streamer.GenerateChannels = generateChannels;
+            // When using the BRG backend with channels, force the fixed atlas resolution so all section
+            // atlases fit the one shared Texture2DArray.
+            _streamer.FixedAtlasResolution = (presenterBackend == PresenterBackend.BatchRendererGroup && generateChannels)
+                ? brgAtlasResolution : 0;
             _streamer.RamCapacity = 256;
 
             var settings = new SectionCompilationSettings
@@ -373,9 +387,11 @@ namespace Fca.MeshTerrain.Demo
 
             if (presenterBackend == PresenterBackend.BatchRendererGroup)
             {
+                int atlasRes = generateChannels ? brgAtlasResolution : 0;
                 _brgPresenter = new Fca.MeshTerrain.Streaming.BatchRendererGroupSectionPresenter(
-                    instancedMaterial, transform, lodTransitionHeights);
+                    instancedMaterial, transform, lodTransitionHeights, atlasRes, brgAtlasCapacity);
                 _brgPresenter.DebugLodColors = debugLodColors;
+                _brgPresenter.ForceLod0 = brgForceLod0;
                 _streamer.SetPresenter(_brgPresenter);
             }
             else
@@ -397,6 +413,10 @@ namespace Fca.MeshTerrain.Demo
             Fca.MeshTerrain.Streaming.StreamingDiagnostics.Reset();
             Fca.MeshTerrain.Streaming.StreamingProfiler.Reset();
             Fca.MeshTerrain.Streaming.StreamingProfiler.Enabled = streamProfiling;
+
+            // Now that every field (incl. FixedAtlasResolution + Definition + stack) is set, activate the GO
+            // so the streamer's OnEnable -> EnsureInitialized caches the correct cook options.
+            go.SetActive(true);
         }
 
         List<ModifierComponent> BuildStreamingStack()

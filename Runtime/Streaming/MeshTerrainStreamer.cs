@@ -52,6 +52,9 @@ namespace Fca.MeshTerrain.Streaming
 
         [Header("Channels")]
         public bool GenerateChannels = true;
+        [Tooltip("Force a fixed channel-atlas resolution (>0) so all section atlases fit one shared " +
+                 "Texture2DArray — required by the instanced (BRG shared-atlas) presenter. 0 = area-adaptive.")]
+        public int FixedAtlasResolution = 0;
 
         [Header("Cache")]
         public int RamCapacity = 128;
@@ -159,6 +162,7 @@ namespace Fca.MeshTerrain.Streaming
 
             _policy = StreamingPolicy.FromDistances(_grid, LoadDistance, UnloadDistance);
             _channelOpts = ChannelCookOptions.FromDefinition(Definition, GenerateChannels);
+            _channelOpts.FixedResolution = FixedAtlasResolution;
 
             _compileSettings = Definition != null
                 ? SectionCompilationSettings.FromDefinition(Definition)

@@ -140,6 +140,7 @@ namespace Fca.MeshTerrain.Streaming
         {
             var uvSettings = ChannelUVSettings.Default;
             uvSettings.TexelSize3D = channels.TexelSize3D;
+            uvSettings.FixedResolution = channels.FixedResolution; // 0 = adaptive; >0 = shared-atlas fixed size
 
             // UV unwrap produces a fresh seam-split mesh + remapped weights; it becomes the cooked mesh so
             // the presenter renders exactly what was rasterized.

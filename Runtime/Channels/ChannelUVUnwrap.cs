@@ -20,12 +20,18 @@ namespace Fca.MeshTerrain
         /// <summary>Target gutter width in output texels (drives the inter-island margin).</summary>
         public float GutterTexelCount;
 
+        /// <summary>When &gt; 0, force this exact atlas resolution (overrides the area-adaptive sizing). Needed
+        /// for the shared-atlas instancing path, where all sections must share one fixed-size
+        /// <see cref="UnityEngine.Texture2DArray"/> (doc plan: brg-shared-atlas-instancing).</summary>
+        public int FixedResolution;
+
         public static ChannelUVSettings Default => new ChannelUVSettings
         {
             TexelSize3D = 100f,
             MaxImageResolution = 4096,
             MinImageResolution = 16,
             GutterTexelCount = 4f,
+            FixedResolution = 0,
         };
     }
 
@@ -285,12 +291,21 @@ namespace Fca.MeshTerrain
             // SectionSize = world-space side length of a unit UV square = sqrt(Area3D / AreaUV).
             double projected = areaUV <= 1e-12 ? 0.0 : area3D / areaUV;
             double sectionSize = math.sqrt(projected);
-            double idealRes = s.TexelSize3D <= 0f ? s.MinImageResolution : sectionSize / s.TexelSize3D;
 
-            int minRes = math.max(1, s.MinImageResolution);
-            idealRes = math.clamp(idealRes, minRes, s.MaxImageResolution);
-            int resolution = (int)(math.ceil(idealRes / 4.0) * 4); // round up to a multiple of 4
-            resolution = math.min(resolution, s.MaxImageResolution);
+            int resolution;
+            if (s.FixedResolution > 0)
+            {
+                // Shared-atlas path: every section uses one uniform resolution so all slices fit one array.
+                resolution = math.max(4, (s.FixedResolution / 4) * 4); // multiple of 4
+            }
+            else
+            {
+                double idealRes = s.TexelSize3D <= 0f ? s.MinImageResolution : sectionSize / s.TexelSize3D;
+                int minRes = math.max(1, s.MinImageResolution);
+                idealRes = math.clamp(idealRes, minRes, s.MaxImageResolution);
+                resolution = (int)(math.ceil(idealRes / 4.0) * 4); // round up to a multiple of 4
+                resolution = math.min(resolution, s.MaxImageResolution);
+            }
 
             return new SectionDomainMapping
             {

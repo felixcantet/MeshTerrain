@@ -90,7 +90,7 @@ namespace Fca.MeshTerrain.Streaming
         /// Bump when the cook pipeline's <b>implementation</b> changes in a way that alters output for the
         /// same params (e.g. partition/skirt/channel code). Mirrors UE <c>MegaMeshClassVersion</c>.
         /// </summary>
-        public const int ClassVersion = 2; // bumped: blob now carries baked LOD chain (doc/08 §8)
+        public const int ClassVersion = 3; // bumped: fixed-resolution atlas option (shared-atlas instancing)
 
         /// <summary>Class-version hash (folded into every key; a bump invalidates the whole cache).</summary>
         public static Hash128 ClassHash()
@@ -128,6 +128,7 @@ namespace Fca.MeshTerrain.Streaming
             h.Append(channels.Generate ? 1 : 0);
             h.Append(channels.TexelSize3D);
             h.Append(channels.GutterFill ? 1 : 0);
+            h.Append(channels.FixedResolution);
 
             // LOD baking affects the cooked bytes (the blob now carries baked LODs).
             h.Append(lod.BakeLods ? 1 : 0);

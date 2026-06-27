@@ -16,12 +16,16 @@ namespace Fca.MeshTerrain.Streaming
         public float TexelSize3D;
         /// <summary>Run the pull-push gutter fill (the border fill always runs).</summary>
         public bool GutterFill;
+        /// <summary>When &gt; 0, bake the atlas at this fixed resolution (required by the shared-atlas
+        /// instancing presenter so all section atlases fit one Texture2DArray). 0 = area-adaptive.</summary>
+        public int FixedResolution;
 
         public static ChannelCookOptions Default => new ChannelCookOptions
         {
             Generate = false,
             TexelSize3D = 100f,
             GutterFill = true,
+            FixedResolution = 0,
         };
 
         public static ChannelCookOptions FromDefinition(MeshPartitionDefinition def, bool generate)
@@ -30,6 +34,7 @@ namespace Fca.MeshTerrain.Streaming
                 Generate = generate,
                 TexelSize3D = def != null ? def.ChannelTexelSize : 100f,
                 GutterFill = true,
+                FixedResolution = 0,
             };
     }
 

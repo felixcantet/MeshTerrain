@@ -24,19 +24,30 @@ namespace Fca.MeshTerrain.Streaming
     public sealed class BatchRendererGroupSectionPresenter : ISectionPresenter, IDisposable
     {
         // Per-instance data laid out for SRP DOTS instancing. The buffer is a Raw (float) buffer:
-        //   [ 16f header ][ ObjectToWorld: 12f*cap ][ WorldToObject: 12f*cap ]
-        // Each matrix is a packed float3x4 (12 floats). All instances are identity (terrain geometry is in
-        // world space). Metadata offsets below are in BYTES.
+        //   [ 16f header ][ ObjectToWorld: 12f*cap ][ WorldToObject: 12f*cap ][ _ChannelParams: 4f*cap ]
+        // Each matrix is a packed float3x4 (12 floats). _ChannelParams = (sliceBase, channelCount, _, _).
+        // Metadata offsets below are in BYTES.
         const int HeaderFloats = 16;                 // 64-byte reserved header (instance 0)
         const int FloatsPerMatrix = 12;              // float3x4
+        const int FloatsPerParams = 4;               // float4
 
         readonly BatchRendererGroup _brg;
-        readonly Material _material;                  // base (untinted) material
+        readonly Material _material;                  // base flat material (sections without channels)
         readonly BatchMaterialID _materialId;
-        // One tinted material variant per LOD band for the LOD-debug view (avoids per-instance shader props /
-        // fragile DOTS macros): the draw command's materialID selects the LOD color. Falls back to _materialId.
+        // One tinted material variant per LOD band for the LOD-debug view (materialID-selected, no DOTS prop).
         BatchMaterialID[] _lodMaterialIds;
         Material[] _lodMaterials;
+
+        // Shared-atlas channel path: ONE material + ONE Texture2DArray for ALL sections, instanced via a
+        // per-instance _ChannelParams (sliceBase, count). This is what makes draw calls stop scaling with
+        // section count (vs one SetPass per section). The atlas requires a uniform cooked resolution.
+        readonly Material _sharedChannelMaterial;
+        readonly BatchMaterialID _sharedChannelMaterialId;
+        readonly bool _hasSharedChannels;
+        SharedChannelAtlas _atlas;
+        readonly int _atlasResolution;
+        readonly int _atlasCapacity;
+        bool _diagLogged;
 
         // One batch over a growable instance buffer; meshes are registered per section.
         GraphicsBuffer _instanceBuffer;
@@ -54,11 +65,18 @@ namespace Fca.MeshTerrain.Streaming
             public Bounds WorldBounds;
             public float3 Center;        // world center, for LOD distance
             public float Radius;         // world bounding radius, for screen-size LOD + cull
+
+            // Shared-atlas channel slices: this section's channels occupy [SliceBase, SliceBase+ChannelCount)
+            // in the shared Texture2DArray. HasChannels=false → drawn with the flat base material.
+            public int SliceBase;
+            public int ChannelCount;
+            public bool HasChannels;
         }
 
         /// <summary>Draw each section with a per-LOD tinted material (LOD0 green → coarse red) so LOD
-        /// selection is visible without wireframe (BRG draws don't show in Scene wireframe). Off = base material.</summary>
-        public bool DebugLodColors = true;
+        /// selection is visible without wireframe (BRG draws don't show in Scene wireframe). Off = the shared
+        /// channel material (or flat base material when a section has no channels).</summary>
+        public bool DebugLodColors = false;
 
         readonly Dictionary<int3, Slot> _slots = new();
         readonly List<Slot> _live = new();              // dense list for draw emission
@@ -69,10 +87,16 @@ namespace Fca.MeshTerrain.Streaming
         // doesn't depend on uncertain LODParameters fields and is predictable for uniform terrain tiles.
         float[] _lodDistanceFactors = { 4f, 10f };
 
-        public BatchRendererGroupSectionPresenter(Material material, Transform root = null, float[] lodTransitionHeights = null)
+        /// <param name="atlasResolution">Fixed shared-atlas slice resolution (must match the cook's
+        /// FixedResolution). 0 disables the shared-channel path (flat material only).</param>
+        /// <param name="atlasCapacity">Max slices in the shared atlas array.</param>
+        public BatchRendererGroupSectionPresenter(Material material, Transform root = null,
+            float[] lodTransitionHeights = null, int atlasResolution = 0, int atlasCapacity = 1024)
         {
             _material = material != null ? material : new Material(Shader.Find("Mesh Terrain/Instanced Flat (URP, BRG)"));
             _root = root;
+            _atlasResolution = atlasResolution;
+            _atlasCapacity = math.max(1, atlasCapacity);
             // Map LODGroup-style screen heights (high→low) to distance factors (near→far): a smaller screen
             // height means the LOD kicks in further away. Rough inverse mapping keeps demo parity.
             if (lodTransitionHeights != null && lodTransitionHeights.Length > 0)
@@ -84,6 +108,20 @@ namespace Fca.MeshTerrain.Streaming
 
             _brg = new BatchRendererGroup(OnPerformCulling, IntPtr.Zero);
             _materialId = _brg.RegisterMaterial(_material);
+
+            // Shared-atlas channel material + array (one for all sections → instanced batches).
+            if (_atlasResolution > 0)
+            {
+                var sharedShader = Shader.Find("Mesh Terrain/Channel Blend Shared Atlas (URP, BRG)");
+                if (sharedShader != null)
+                {
+                    _atlas = new SharedChannelAtlas(_atlasResolution, _atlasCapacity);
+                    _sharedChannelMaterial = new Material(sharedShader) { name = "SharedChannels" };
+                    _sharedChannelMaterial.SetTexture("_ChannelTex", _atlas.Texture);
+                    _sharedChannelMaterialId = _brg.RegisterMaterial(_sharedChannelMaterial);
+                    _hasSharedChannels = true;
+                }
+            }
 
             // Per-LOD tinted material variants (debug view). Each is a clone of the base with _LodColor set.
             _lodMaterials = new Material[LodDebugColors.Length];
@@ -134,12 +172,40 @@ namespace Fca.MeshTerrain.Streaming
                 Radius = math.length((float3)bounds.extents),
             };
 
+            // Shared-atlas channels: reserve a slice range and upload this section's R8 blob (channel c at
+            // slice sliceBase+c). The per-instance _ChannelParams (sliceBase, count) is written below.
+            if (cooked.HasAtlas && _hasSharedChannels && cooked.ChannelAtlasResolution == _atlasResolution)
+            {
+                int channelCount = math.max(1, cooked.ChannelAtlasSlices);
+                int sliceBase = _atlas.Allocate(channelCount);
+                if (sliceBase >= 0)
+                {
+                    _atlas.WriteSlices(sliceBase, cooked.ChannelAtlasBlob, cooked.ChannelAtlasResolution, channelCount);
+                    slot.SliceBase = sliceBase;
+                    slot.ChannelCount = channelCount;
+                    slot.HasChannels = true;
+                }
+                else
+                {
+                    Debug.LogWarning($"SharedChannelAtlas full (cap {_atlasCapacity}); section {cooked.Coord} drawn flat.");
+                }
+            }
+            else if (!_diagLogged)
+            {
+                // One-time diagnostic so a silent flat fallback is explainable.
+                _diagLogged = true;
+                Debug.LogWarning($"BRG channels OFF for {cooked.Coord}: HasAtlas={cooked.HasAtlas}, " +
+                    $"sharedChannels={_hasSharedChannels}, cookedRes={cooked.ChannelAtlasResolution}, atlasRes={_atlasResolution}, " +
+                    $"slices={cooked.ChannelAtlasSlices}. (atlasRes 0 = constructor got resolution 0; res mismatch = cook not fixed-res.)");
+            }
+
             slot.Index = _live.Count + 1;     // instance 0 reserved
             _live.Add(slot);
             _slots[cooked.Coord] = slot;
 
             EnsureCapacity(_live.Count + 1);
             WriteInstance(slot.Index, slot.ObjectToWorld);
+            WriteChannelParams(slot.Index, slot.HasChannels ? slot.SliceBase : 0, slot.HasChannels ? slot.ChannelCount : 0);
 
             return slot;
         }
@@ -169,19 +235,30 @@ namespace Fca.MeshTerrain.Streaming
 
         void DestroyLods(Slot slot)
         {
-            if (slot.LodMeshes == null) return;
-            for (int i = 0; i < slot.LodMeshes.Length; i++)
+            if (slot.LodMeshes != null)
             {
-                _brg.UnregisterMesh(slot.LodIds[i]);
-                Mesh m = slot.LodMeshes[i];
-                if (m != null)
+                for (int i = 0; i < slot.LodMeshes.Length; i++)
                 {
-                    if (Application.isPlaying) UnityEngine.Object.Destroy(m);
-                    else UnityEngine.Object.DestroyImmediate(m);
+                    _brg.UnregisterMesh(slot.LodIds[i]);
+                    DestroyObj(slot.LodMeshes[i]);
                 }
+                slot.LodMeshes = null;
+                slot.LodIds = null;
             }
-            slot.LodMeshes = null;
-            slot.LodIds = null;
+
+            // Return the section's shared-atlas slice range to the allocator.
+            if (slot.HasChannels && _atlas != null)
+            {
+                _atlas.Free(slot.SliceBase, slot.ChannelCount);
+                slot.HasChannels = false;
+            }
+        }
+
+        static void DestroyObj(UnityEngine.Object o)
+        {
+            if (o == null) return;
+            if (Application.isPlaying) UnityEngine.Object.Destroy(o);
+            else UnityEngine.Object.DestroyImmediate(o);
         }
 
         // ---- BRG culling callback ----
@@ -238,10 +315,11 @@ namespace Fca.MeshTerrain.Streaming
                 Slot s = _live[slotOf[i]];
                 int lod = lodOf[i];
                 output.visibleInstances[i] = s.Index;
-                // Per-LOD tinted material when debugging; otherwise the base material.
+                // Material priority: LOD-debug tint (if on) > the SHARED channel material (one for all
+                // channel sections → they batch) > the flat base material (sections without channels).
                 BatchMaterialID mat = DebugLodColors
                     ? _lodMaterialIds[math.min(lod, _lodMaterialIds.Length - 1)]
-                    : _materialId;
+                    : (s.HasChannels ? _sharedChannelMaterialId : _materialId);
                 output.drawCommands[i] = new BatchDrawCommand
                 {
                     visibleOffset = (uint)i,
@@ -282,10 +360,15 @@ namespace Fca.MeshTerrain.Streaming
             return new JobHandle();
         }
 
+        /// <summary>Debug: force every section to LOD0 (disable LOD switching) — to isolate whether LOD
+        /// simplification is corrupting channel UVs (broken paint arcs on far/coarse sections).</summary>
+        public bool ForceLod0;
+
         /// <summary>Distance-based LOD: LOD i is used until camera distance exceeds factor[i]*radius, then the
         /// next coarser LOD; the last LOD is the fallthrough.</summary>
         int SelectLod(float distance, float radius, int lodCount)
         {
+            if (ForceLod0) return 0;
             int last = lodCount - 1;
             for (int i = 0; i < last && i < _lodDistanceFactors.Length; i++)
                 if (distance <= _lodDistanceFactors[i] * radius) return i;
@@ -309,6 +392,7 @@ namespace Fca.MeshTerrain.Streaming
         // Float-word offsets into the Raw buffer (regions sized by capacity).
         int ObjRegionStart => HeaderFloats;
         int WorldRegionStart => HeaderFloats + _capacity * FloatsPerMatrix;
+        int ParamsRegionStart => HeaderFloats + _capacity * FloatsPerMatrix * 2;
 
         void EnsureCapacity(int neededInstances)
         {
@@ -316,7 +400,8 @@ namespace Fca.MeshTerrain.Streaming
             if (needed <= _capacity && _instanceBuffer != null) return;
 
             int newCap = math.max(256, math.ceilpow2(needed));
-            int totalFloats = HeaderFloats + newCap * FloatsPerMatrix * 2; // ObjToWorld + WorldToObject regions
+            // ObjToWorld + WorldToObject + _ChannelParams regions.
+            int totalFloats = HeaderFloats + newCap * (FloatsPerMatrix * 2 + FloatsPerParams);
 
             var newBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Raw, totalFloats, sizeof(float));
 
@@ -332,15 +417,30 @@ namespace Fca.MeshTerrain.Streaming
             // (Re)register the single batch over the new buffer with the metadata layout. Offsets in BYTES.
             if (_batchValid) { _brg.RemoveBatch(_batchId); _batchValid = false; }
 
-            var metadata = new NativeArray<MetadataValue>(2, Allocator.Temp);
+            var metadata = new NativeArray<MetadataValue>(3, Allocator.Temp);
             metadata[0] = new MetadataValue { NameID = Shader.PropertyToID("unity_ObjectToWorld"), Value = 0x80000000 | (uint)(ObjRegionStart * sizeof(float)) };
             metadata[1] = new MetadataValue { NameID = Shader.PropertyToID("unity_WorldToObject"), Value = 0x80000000 | (uint)(WorldRegionStart * sizeof(float)) };
+            metadata[2] = new MetadataValue { NameID = Shader.PropertyToID("_ChannelParams"), Value = 0x80000000 | (uint)(ParamsRegionStart * sizeof(float)) };
             _batchId = _brg.AddBatch(metadata, _instanceBuffer.bufferHandle);
             _batchValid = true;
             metadata.Dispose();
 
             for (int i = 0; i < _live.Count; i++)
+            {
                 WriteInstance(_live[i].Index, _live[i].ObjectToWorld);
+                WriteChannelParams(_live[i].Index, _live[i].HasChannels ? _live[i].SliceBase : 0,
+                                                   _live[i].HasChannels ? _live[i].ChannelCount : 0);
+            }
+        }
+
+        /// <summary>Writes the per-instance _ChannelParams = (sliceBase, channelCount, 0, 0).</summary>
+        void WriteChannelParams(int index, int sliceBase, int channelCount)
+        {
+            var p = new NativeArray<float>(FloatsPerParams, Allocator.Temp);
+            p[0] = sliceBase; p[1] = channelCount; p[2] = 0f; p[3] = 0f;
+            // index*stride (not index-1): DOTS reads at instanceID*stride; see WriteInstance.
+            _instanceBuffer.SetData(p, 0, ParamsRegionStart + index * FloatsPerParams, FloatsPerParams);
+            p.Dispose();
         }
 
         static readonly float4[] LodDebugColors =
@@ -361,8 +461,12 @@ namespace Fca.MeshTerrain.Streaming
             var wor = new NativeArray<float>(FloatsPerMatrix, Allocator.Temp);
             PackFloat3x4(worldToObj, wor);
 
-            int objStart = ObjRegionStart + (index - 1) * FloatsPerMatrix;
-            int worStart = WorldRegionStart + (index - 1) * FloatsPerMatrix;
+            // DOTS reads per-instance data at metadataOffset + instanceID*stride, where instanceID == Index
+            // (the value put in visibleInstances). So write at index*stride, NOT (index-1)*stride. Instance 0
+            // is reserved. (This off-by-one was invisible for matrices since they're all identity, but it
+            // shifted each section's per-instance _ChannelParams to its neighbour → displaced paint.)
+            int objStart = ObjRegionStart + index * FloatsPerMatrix;
+            int worStart = WorldRegionStart + index * FloatsPerMatrix;
             _instanceBuffer.SetData(obj, 0, objStart, FloatsPerMatrix);
             _instanceBuffer.SetData(wor, 0, worStart, FloatsPerMatrix);
 
@@ -409,9 +513,16 @@ namespace Fca.MeshTerrain.Streaming
                 }
                 _lodMaterials = null;
             }
+            if (_hasSharedChannels)
+            {
+                _brg.UnregisterMaterial(_sharedChannelMaterialId);
+                DestroyObj(_sharedChannelMaterial);
+            }
             _brg.Dispose();
             _instanceBuffer?.Dispose();
             _instanceBuffer = null;
+            _atlas?.Dispose();
+            _atlas = null;
         }
     }
 }
