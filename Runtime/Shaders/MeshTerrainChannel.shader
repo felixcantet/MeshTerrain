@@ -44,6 +44,7 @@ Shader "Mesh Terrain/Channel Blend (URP)"
             #pragma multi_compile _ _MAIN_LIGHT_SHADOWS _MAIN_LIGHT_SHADOWS_CASCADE
             #pragma multi_compile_fragment _ _ADDITIONAL_LIGHTS
             #pragma multi_compile_fragment _ _SHADOWS_SOFT
+            #pragma multi_compile _ _TERRAIN_LAYERS   // on = blend material layers; off = flat debug colors
 
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
@@ -62,6 +63,10 @@ Shader "Mesh Terrain/Channel Blend (URP)"
             float  _ChannelSlices[24];
             float4 _ChannelTexcoord;
             float  _ChannelCount;
+
+            // Terrain layer params (global, set via Shader.SetGlobal*) used by the layer-blend include below.
+            float4 _LayerParams[24]; // per-channel (tiling, normalStrength, heightContrast, _)
+            float  _LayerCount;
 
             CBUFFER_START(UnityPerMaterial)
                 float4 _BaseColor;
@@ -104,6 +109,18 @@ Shader "Mesh Terrain/Channel Blend (URP)"
                 return _ChannelColor7;
             }
 
+            // Per-fragment context for the shared layer-blend include. The GameObject path samples its own
+            // per-section atlas at the table-mapped slice for global channel c.
+            static float2 _glChannelUV;
+            float SampleGameObjectChannelWeight(int c)
+            {
+                int slice = ChannelSlice(c);
+                if (slice < 0 || slice >= 31) return 0.0;
+                return saturate(SAMPLE_TEXTURE2D_ARRAY(_ChannelTex, sampler_ChannelTex, _glChannelUV, slice).r);
+            }
+            #define SAMPLE_CHANNEL_WEIGHT(c) SampleGameObjectChannelWeight(c)
+            #include "MeshTerrainChannelBlend.hlsl"
+
             Varyings vert(Attributes IN)
             {
                 Varyings OUT;
@@ -119,48 +136,55 @@ Shader "Mesh Terrain/Channel Blend (URP)"
             half4 frag(Varyings IN) : SV_Target
             {
                 int count = (int)round(_ChannelCount);
+                _glChannelUV = IN.channelUV;
 
-                // Start from the base color so unpainted terrain is always visible. Channel weights
-                // blend their colors on top of it; the base shows through where weights are low.
+                float3 worldNormal = normalize(IN.normalWS);
                 float3 albedo = _BaseColor.rgb;
+                float roughness = 1.0 - _Smoothness;
+                float metallic = _Metallic;
+                float ao = 1.0;
+                float3 normalWS = worldNormal;
+
+            #ifdef _TERRAIN_LAYERS
+                // Blend per-channel material layers (albedo/normal/mask) by height-biased channel weight.
+                TerrainSurface ts = BlendTerrainLayers(IN.positionWS.xz, _BaseColor.rgb);
+                albedo = ts.albedo;
+                roughness = ts.roughness;
+                metallic = ts.metallic;
+                ao = ts.ao;
+                float3 t = normalize(float3(1, 0, 0) - worldNormal * worldNormal.x);
+                float3 b = cross(worldNormal, t);
+                normalWS = normalize(t * ts.normalTS.x + b * ts.normalTS.y + worldNormal * ts.normalTS.z);
+            #else
+                // Flat debug-color blend (visualizer).
                 float totalWeight = 0;
                 float3 blended = 0;
-
                 [loop]
                 for (int c = 0; c < count && c < 24; c++)
                 {
                     int slice = ChannelSlice(c);
-                    if (slice < 0 || slice >= 31) continue; // SlotInvalid / garbage -> channel absent
-                    float w = SAMPLE_TEXTURE2D_ARRAY(_ChannelTex, sampler_ChannelTex, IN.channelUV, slice).r;
-                    w = saturate(w);
+                    if (slice < 0 || slice >= 31) continue;
+                    float w = saturate(SAMPLE_TEXTURE2D_ARRAY(_ChannelTex, sampler_ChannelTex, IN.channelUV, slice).r);
                     blended += ChannelColor(c).rgb * w;
                     totalWeight += w;
                 }
-
-                // Lerp the base toward the (weight-normalized) channel blend by how much weight
-                // covers this texel. Painted areas show the channel colors; the rest stays base.
                 totalWeight = saturate(totalWeight);
                 if (totalWeight > 1e-4)
-                {
-                    float3 channelColor = blended / max(totalWeight, 1e-4);
-                    albedo = lerp(_BaseColor.rgb, channelColor, totalWeight);
-                }
+                    albedo = lerp(_BaseColor.rgb, blended / max(totalWeight, 1e-4), totalWeight);
+            #endif
 
-                // Build lighting input with baked GI so output is never pitch black under GI-only.
                 InputData lightingInput = (InputData)0;
                 lightingInput.positionWS = IN.positionWS;
-                lightingInput.normalWS = normalize(IN.normalWS);
+                lightingInput.normalWS = normalWS;
                 lightingInput.viewDirectionWS = GetWorldSpaceNormalizeViewDir(IN.positionWS);
                 lightingInput.shadowCoord = TransformWorldToShadowCoord(IN.positionWS);
-                // Baked GI with a small ambient floor so the terrain is legible even when the scene
-                // has no directional light and a black ambient/skybox (a common empty-scene setup).
-                lightingInput.bakedGI = max(SampleSH(lightingInput.normalWS), 0.15);
+                lightingInput.bakedGI = max(SampleSH(normalWS), 0.15);
 
                 SurfaceData surface = (SurfaceData)0;
                 surface.albedo = albedo;
-                surface.metallic = _Metallic;
-                surface.smoothness = _Smoothness;
-                surface.occlusion = 1.0;
+                surface.metallic = metallic;
+                surface.smoothness = 1.0 - roughness;
+                surface.occlusion = ao;
                 surface.alpha = 1.0;
 
                 return UniversalFragmentPBR(lightingInput, surface);

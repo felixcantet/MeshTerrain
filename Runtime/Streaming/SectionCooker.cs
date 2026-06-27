@@ -119,6 +119,26 @@ namespace Fca.MeshTerrain.Streaming
             }
         }
 
+        /// <summary>
+        /// Builds a weight set containing EVERY global channel in <paramref name="globalNames"/> order: copies
+        /// the section's values where present, fills zero where absent. This makes the rasterized atlas slice
+        /// index equal the global channel index for every section (shared-atlas requirement).
+        /// </summary>
+        static WeightLayerSet NormalizeToGlobalChannels(WeightLayerSet src, string[] globalNames, int vertexCount, Allocator allocator)
+        {
+            var result = new WeightLayerSet(allocator);
+            for (int i = 0; i < globalNames.Length; i++)
+            {
+                var dst = result.InitializeLayer(globalNames[i], vertexCount); // zero-filled by InitializeLayer
+                if (src != null && src.TryGetLayer(globalNames[i], out var srcLayer))
+                {
+                    int n = math.min(vertexCount, srcLayer.Length);
+                    for (int v = 0; v < n; v++) dst[v] = srcLayer[v];
+                }
+            }
+            return result;
+        }
+
         /// <summary>Positions + indices only copy (collision geometry needs no normals/UVs/weights).</summary>
         static MeshData CopyGeometry(in MeshData src, Allocator allocator)
         {
@@ -142,11 +162,23 @@ namespace Fca.MeshTerrain.Streaming
             uvSettings.TexelSize3D = channels.TexelSize3D;
             uvSettings.FixedResolution = channels.FixedResolution; // 0 = adaptive; >0 = shared-atlas fixed size
 
+            // Normalize the weight set to GLOBAL channel order so atlas slice i == global channel i for EVERY
+            // section (the shared atlas requires this; otherwise a section's local layer order makes slice
+            // indices inconsistent → channels scatter onto the wrong slices across tiles).
+            WeightLayerSet normalized = null;
+            WeightLayerSet weightsForRaster = cooked.Weights;
+            if (channels.ChannelNames != null && channels.ChannelNames.Length > 0)
+            {
+                normalized = NormalizeToGlobalChannels(cooked.Weights, channels.ChannelNames, cooked.Mesh.VertexCount, allocator);
+                weightsForRaster = normalized;
+            }
+
             // UV unwrap produces a fresh seam-split mesh + remapped weights; it becomes the cooked mesh so
             // the presenter renders exactly what was rasterized.
             MeshData split = ChannelUVUnwrap.Generate(
-                cooked.Mesh, cooked.Weights, uvSettings, allocator,
+                cooked.Mesh, weightsForRaster, uvSettings, allocator,
                 out WeightLayerSet splitWeights, out SectionDomainMapping mapping);
+            normalized?.Dispose();
 
             ChannelRasterBytes bytes = ChannelRasterizerCPU.RenderToBytes(
                 split, splitWeights, mapping, channels.GutterFill);

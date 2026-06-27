@@ -188,9 +188,33 @@ state of the art », pas en Phase 4.
 
 ## Phase 5 — Streaming & build incrémental ⬜
 
-- [ ] Streaming par section (Addressables / scènes additives).
-- [ ] FarFieldMesh / impostors.
-- [ ] Build incrémental (hash par modifier + cache disque).
+> **Design** : [`08_STREAMING_SYSTEM_DESIGN.md`](08_STREAMING_SYSTEM_DESIGN.md) — solution de
+> streaming custom **supportant la génération procédurale au runtime** (cook paresseux + cache disque,
+> presenter agnostique du backend). Diverge volontairement d'UE (build-time only) pour ajouter le
+> runtime-gen ; collapse vers le modèle préfabriqué d'UE en shippant le cache. Ce document pilote la
+> Phase 5. Jalons : 5.0 `ProcessCell` borné → 5.1 cache → 5.2 presenter seam → 5.3 streamer →
+> 5.4 invalidation incrémentale → 5.5 far-field (opt.).
+
+- [x] **5.0** Build borné par cellule (`ModifierGroup.ProcessCell`) + golden test vs build complet.
+- [x] **5.1** `CookedSection` + sérialisation blob + `SectionCache` (RAM LRU + disque) + `SectionKey`/hash.
+- [x] **5.2** Seam `ISectionPresenter` + `GameObjectSectionPresenter` (réutilise `SectionCompiler`).
+- [x] **5.3** `MeshTerrainStreamer` : résidence, hystérésis, file budgétée, éviction sans fuite.
+- [ ] **5.4** Invalidation incrémentale (hash scopé par bounds modifier). *(en partie : `InvalidateModifier` + hash scopé livrés en 5.1/5.3 ; reste l'API d'édition.)*
+- [ ] **5.5** FarFieldMesh / impostors anti-pop *(optionnel)*.
+
+**Pass async + performance (sur 5.3)** : le cook tourne sur un thread worker (`Task.Run`) — modifiers,
+partition (chemin `PartitionImmediate` sans Job System), rasterisation channel (`RenderToBytes` sans
+`Texture2DArray`), **simplification LOD** (`SectionLODBaker`, simplifier alimenté par tableaux bruts), skirt,
+collision (unskirted, simplifiée), et **sérialisation du blob** — tout hors main thread. Le present est
+upload-only (`SectionCompiler.CompilePrebaked`) : ~1.4 ms/section. Budget : `MaxPresentsPerFrame` +
+`MaxMillisPerFrame`. Cache : écriture disque async, cooks annulés mis en cache (anti-churn). Blob v2 (LODs +
+collision). Instrumentation : `StreamingProfiler` (phases + samples), `StreamingDiagnostics`.
+
+> **Plafond connu (architecture)** : le rendu **GameObject par section** (`MeshRenderer`/LODGroup/`MeshCollider`)
+> a un coût main-thread irréductible par tuile (upload mesh, AddComponent, cook PhysX). Le cœur
+> cook/cache/streamer est **agnostique du backend** (`ISectionPresenter`, `08 §4`) ; le passage à l'échelle
+> « monde large » passe par un presenter **GPU-driven** (`BatchRendererGroup` / `RenderMeshIndirect`,
+> instancing, culling/LOD GPU). C'est le prochain jalon (présenter instancié), sans toucher au cœur.
 
 ---
 
