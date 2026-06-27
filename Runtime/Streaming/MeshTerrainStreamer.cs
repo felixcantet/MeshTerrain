@@ -22,6 +22,7 @@ namespace Fca.MeshTerrain.Streaming
     /// synchronous under a count budget (async Burst/GPU cooking is a later optimization). Editor/MonoBehaviour
     /// modifier authoring is Phase 6.</para>
     /// </summary>
+    [ExecuteAlways]
     [AddComponentMenu("Mesh Terrain/Mesh Terrain Streamer")]
     public sealed class MeshTerrainStreamer : MonoBehaviour
     {
@@ -138,8 +139,44 @@ namespace Fca.MeshTerrain.Streaming
         /// <summary>Overrides the default <see cref="GameObjectSectionPresenter"/> (e.g. for tests).</summary>
         public void SetPresenter(ISectionPresenter presenter) => _presenter = presenter;
 
-        void OnEnable() => EnsureInitialized();
-        void OnDisable() => Teardown();
+        void OnEnable()
+        {
+            EnsureInitialized();
+#if UNITY_EDITOR
+            // In edit mode, MonoBehaviour.Update is unreliable (fires only on changes), so drive the streamer
+            // from the editor update loop — full streaming (cook/cache/present + BRG render) without Play.
+            if (!Application.isPlaying)
+            {
+                UnityEditor.EditorApplication.update += EditorTick;
+                UnityEditor.AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
+            }
+#endif
+        }
+
+        void OnDisable()
+        {
+#if UNITY_EDITOR
+            UnityEditor.EditorApplication.update -= EditorTick;
+            UnityEditor.AssemblyReloadEvents.beforeAssemblyReload -= OnBeforeAssemblyReload;
+#endif
+            Teardown();
+        }
+
+#if UNITY_EDITOR
+        // Tear down BEFORE a domain reload so native memory / BRG / GraphicsBuffers don't leak across reloads.
+        void OnBeforeAssemblyReload() => Teardown();
+
+        void EditorTick()
+        {
+            if (Application.isPlaying || this == null) return;
+            var sv = UnityEditor.SceneView.lastActiveSceneView;
+            Transform focus = Focus != null ? Focus : (sv != null && sv.camera != null ? sv.camera.transform : null);
+            if (focus == null) return;
+            Tick(focus.position);
+            // Repaint the Scene view so newly-presented BRG sections appear without a manual mouse move.
+            if (_pending.Count > 0 || _loadQueue.Count > 0) UnityEditor.SceneView.RepaintAll();
+        }
+#endif
 
         void EnsureInitialized()
         {
@@ -194,6 +231,8 @@ namespace Fca.MeshTerrain.Streaming
 
         void Update()
         {
+            // Edit mode is driven by EditorTick (Update is unreliable there); avoid double-ticking.
+            if (!Application.isPlaying) return;
             if (!_initialized || _stack.Count == 0) return;
             Transform focus = Focus != null ? Focus : (Camera.main != null ? Camera.main.transform : null);
             if (focus == null) return;

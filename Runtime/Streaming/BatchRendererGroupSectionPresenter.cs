@@ -49,6 +49,10 @@ namespace Fca.MeshTerrain.Streaming
         readonly int _atlasCapacity;
         bool _diagLogged;
         TerrainLayerArrays _layerArrays;   // shared per-channel material layers (albedo/normal/mask)
+        Material _pickingMaterial;
+        /// <summary>Unity object instance ID that editor picking/box-select maps the sections to (e.g. the
+        /// streamer GameObject). 0 = sections aren't selectable. Set via <see cref="SetPickingObject"/>.</summary>
+        int _pickingObjectId;
 
         // One batch over a growable instance buffer; meshes are registered per section.
         GraphicsBuffer _instanceBuffer;
@@ -110,6 +114,26 @@ namespace Fca.MeshTerrain.Streaming
             _brg = new BatchRendererGroup(OnPerformCulling, IntPtr.Zero);
             _materialId = _brg.RegisterMaterial(_material);
 
+#if UNITY_EDITOR
+            // Editor picking + selection (click-pick AND box/rectangle select) for BRG-drawn sections, which
+            // aren't GameObjects. Requires: a picking material, ALL view types enabled (Picking is click,
+            // SelectionOutline is box-select), and per-draw-command picking instance IDs in OnPerformCulling.
+            var pickShader = Shader.Find("Hidden/Universal Render Pipeline/BRGPicking");
+            if (pickShader != null)
+            {
+                _pickingMaterial = new Material(pickShader) { name = "BRGPicking" };
+                _brg.SetPickingMaterial(_pickingMaterial);
+            }
+            _brg.SetEnabledViewTypes(new[]
+            {
+                BatchCullingViewType.Camera,
+                BatchCullingViewType.Light,
+                BatchCullingViewType.Picking,
+                BatchCullingViewType.SelectionOutline,
+                BatchCullingViewType.Filtering,
+            });
+#endif
+
             // Shared-atlas channel material + array (one for all sections → instanced batches).
             if (_atlasResolution > 0)
             {
@@ -140,6 +164,14 @@ namespace Fca.MeshTerrain.Streaming
             _brg.SetGlobalBounds(new Bounds(Vector3.zero, Vector3.one * 1_000_000f));
 
             EnsureCapacity(256);
+        }
+
+        /// <summary>Sets the Unity object whose instance ID editor picking/box-select maps the BRG sections to
+        /// (typically the streamer's GameObject — sections aren't individual GameObjects). Pass null to disable
+        /// selection.</summary>
+        public void SetPickingObject(UnityEngine.Object obj)
+        {
+            _pickingObjectId = obj != null ? obj.GetInstanceID() : 0;
         }
 
         /// <summary>Builds the shared per-channel material layer arrays from the Definition and binds them on
@@ -345,7 +377,19 @@ namespace Fca.MeshTerrain.Streaming
                 };
             }
 
-            output.drawCommandPickingInstanceIDs = null;
+            // Editor picking/box-select: one Unity instance ID per draw command (all sections map to the
+            // streamer object so selecting any section selects the streamer). Only needed for picking views,
+            // but harmless to always provide.
+            if (_pickingObjectId != 0)
+            {
+                output.drawCommandPickingInstanceIDs = Malloc<int>(visible);
+                for (int i = 0; i < visible; i++) output.drawCommandPickingInstanceIDs[i] = _pickingObjectId;
+            }
+            else
+            {
+                output.drawCommandPickingInstanceIDs = null;
+            }
+
             output.drawRangeCount = 1;
             output.drawRanges = Malloc<BatchDrawRange>(1);
             output.drawRanges[0] = new BatchDrawRange
@@ -536,6 +580,8 @@ namespace Fca.MeshTerrain.Streaming
             _atlas = null;
             _layerArrays?.Dispose();
             _layerArrays = null;
+            DestroyObj(_pickingMaterial);
+            _pickingMaterial = null;
         }
     }
 }

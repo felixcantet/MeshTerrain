@@ -399,6 +399,7 @@ namespace Fca.MeshTerrain.Demo
                 _brgPresenter.ForceLod0 = brgForceLod0;
                 if (channelLayers != null && channelLayers.Count > 0)
                     _brgPresenter.SetTerrainLayers(channelLayers, layerArrayResolution);
+                _brgPresenter.SetPickingObject(go); // editor click/box-select the streamer GO via its sections
                 _streamer.SetPresenter(_brgPresenter);
             }
             else
