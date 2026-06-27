@@ -98,6 +98,11 @@ namespace Fca.MeshTerrain.Demo
         public int brgAtlasCapacity = 1024;
         [Tooltip("BRG debug: force LOD0 for all sections (isolates whether LOD simplification corrupts channel UVs).")]
         public bool brgForceLod0 = false;
+        [Tooltip("Per-channel material layers (albedo/normal/mask + tiling). Layer i blends where channel i's " +
+                 "weight is high. Empty = flat debug colors. The demo paints channel 0 ('Grass'), so layer 0 shows.")]
+        public List<TerrainLayer> channelLayers = new();
+        [Tooltip("Resolution of the built terrain layer Texture2DArrays.")]
+        public int layerArrayResolution = 512;
         [Tooltip("BRG backend: tint each tile by its selected LOD (green=LOD0, yellow=LOD1, red=LOD2+) so " +
                  "LOD selection is visible (BRG draws don't show in Scene wireframe). Off = channel blend.")]
         public bool debugLodColors = false;
@@ -392,6 +397,8 @@ namespace Fca.MeshTerrain.Demo
                     instancedMaterial, transform, lodTransitionHeights, atlasRes, brgAtlasCapacity);
                 _brgPresenter.DebugLodColors = debugLodColors;
                 _brgPresenter.ForceLod0 = brgForceLod0;
+                if (channelLayers != null && channelLayers.Count > 0)
+                    _brgPresenter.SetTerrainLayers(channelLayers, layerArrayResolution);
                 _streamer.SetPresenter(_brgPresenter);
             }
             else
@@ -407,6 +414,12 @@ namespace Fca.MeshTerrain.Demo
             def.Is2D = true;
             def.Material = material;
             def.ChannelTexelSize = channelTexelSize;
+            // Declare the GLOBAL channel names in a fixed order so the shared atlas indexes slices by global
+            // channel (slice i == channel i for every section). Index 0 = the painted channel; pad to the
+            // number of assigned material layers so each layer maps to a stable global channel.
+            int channelCount = Mathf.Max(1, channelLayers != null ? channelLayers.Count : 1);
+            def.ChannelNames = new List<string> { paintChannel };
+            for (int i = 1; i < channelCount; i++) def.ChannelNames.Add($"Channel{i}");
             _streamer.Definition = def;
 
             _streamer.SetModifierStack(BuildStreamingStack());
@@ -445,7 +458,23 @@ namespace Fca.MeshTerrain.Demo
                 Radius = paintRadius, Falloff = paintFalloff,
                 InnerValue = 1f, OuterValue = 0f,
             };
-            return new List<ModifierComponent> { rect, noise, paint };
+
+            var stack = new List<ModifierComponent> { rect, noise, paint };
+
+            // If a 2nd material layer is assigned, paint a 2nd channel ("Channel1") overlapping the first so
+            // the layer BLEND is actually visible (channel 0 fades into channel 1 in the overlap).
+            if (channelLayers != null && channelLayers.Count >= 2)
+            {
+                var paint2 = new WeightUtilityModifier
+                {
+                    WeightChannelName = "Channel1",
+                    Center = new float3(paintRadius * 0.8f, 0, 0), // offset so it overlaps channel 0
+                    Radius = paintRadius, Falloff = paintFalloff,
+                    InnerValue = 1f, OuterValue = 0f,
+                };
+                stack.Add(paint2);
+            }
+            return stack;
         }
 
         void OnDrawGizmosSelected()

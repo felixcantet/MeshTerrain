@@ -163,6 +163,9 @@ namespace Fca.MeshTerrain.Streaming
             _policy = StreamingPolicy.FromDistances(_grid, LoadDistance, UnloadDistance);
             _channelOpts = ChannelCookOptions.FromDefinition(Definition, GenerateChannels);
             _channelOpts.FixedResolution = FixedAtlasResolution;
+            // Global channel order so the shared atlas has slice i == global channel i for every section.
+            if (Definition != null && Definition.ChannelNames != null && Definition.ChannelNames.Count > 0)
+                _channelOpts.ChannelNames = Definition.ChannelNames.ToArray();
 
             _compileSettings = Definition != null
                 ? SectionCompilationSettings.FromDefinition(Definition)

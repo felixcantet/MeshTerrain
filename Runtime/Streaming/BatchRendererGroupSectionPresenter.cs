@@ -48,6 +48,7 @@ namespace Fca.MeshTerrain.Streaming
         readonly int _atlasResolution;
         readonly int _atlasCapacity;
         bool _diagLogged;
+        TerrainLayerArrays _layerArrays;   // shared per-channel material layers (albedo/normal/mask)
 
         // One batch over a growable instance buffer; meshes are registered per section.
         GraphicsBuffer _instanceBuffer;
@@ -139,6 +140,16 @@ namespace Fca.MeshTerrain.Streaming
             _brg.SetGlobalBounds(new Bounds(Vector3.zero, Vector3.one * 1_000_000f));
 
             EnsureCapacity(256);
+        }
+
+        /// <summary>Builds the shared per-channel material layer arrays from the Definition and binds them on
+        /// the shared channel material (enabling the layer-blend shader path). Call once after construction.</summary>
+        public void SetTerrainLayers(System.Collections.Generic.IReadOnlyList<TerrainLayer> layers, int resolution = 512)
+        {
+            _layerArrays?.Dispose();
+            _layerArrays = TerrainLayerArrays.Build(layers, resolution);
+            if (_layerArrays != null && _sharedChannelMaterial != null)
+                _layerArrays.Apply(_sharedChannelMaterial);
         }
 
         // ---- ISectionPresenter ----
@@ -523,6 +534,8 @@ namespace Fca.MeshTerrain.Streaming
             _instanceBuffer = null;
             _atlas?.Dispose();
             _atlas = null;
+            _layerArrays?.Dispose();
+            _layerArrays = null;
         }
     }
 }

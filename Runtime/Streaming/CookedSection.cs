@@ -20,6 +20,12 @@ namespace Fca.MeshTerrain.Streaming
         /// instancing presenter so all section atlases fit one Texture2DArray). 0 = area-adaptive.</summary>
         public int FixedResolution;
 
+        /// <summary>Global channel names (the Definition's order). When set, the cook rasterizes atlas slices in
+        /// THIS order for every section (padding absent channels with zero), so slice <c>i</c> == global channel
+        /// <c>i</c> consistently — required by the shared atlas (presenter samples sliceBase + globalChannel).
+        /// Null/empty = per-section local order (only valid for the per-section GameObject atlas path).</summary>
+        public string[] ChannelNames;
+
         public static ChannelCookOptions Default => new ChannelCookOptions
         {
             Generate = false,

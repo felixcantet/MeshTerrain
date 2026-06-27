@@ -22,6 +22,13 @@ namespace Fca.MeshTerrain
         public List<string> ChannelNames = new();
 
         /// <summary>
+        /// Per-channel material layer (albedo/normal/mask + params), parallel to <see cref="ChannelNames"/>:
+        /// channel <c>i</c> blends layer <c>i</c> by its weight. Mirrors UE's per-channel material data. Empty
+        /// → the terrain shader falls back to flat debug colors. Max 24 (the channel-packing cap).
+        /// </summary>
+        public List<TerrainLayer> ChannelLayers = new();
+
+        /// <summary>
         /// Partition grid cell size in world units. 0 = no split (single section).
         /// Consumed by the grid in Phase 1 (UE <c>FGridSettings.CellSize</c>).
         /// </summary>

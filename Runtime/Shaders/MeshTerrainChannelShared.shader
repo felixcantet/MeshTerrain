@@ -44,6 +44,7 @@ Shader "Mesh Terrain/Channel Blend Shared Atlas (URP, BRG)"
             #pragma multi_compile _ _MAIN_LIGHT_SHADOWS _MAIN_LIGHT_SHADOWS_CASCADE
             #pragma multi_compile_fragment _ _ADDITIONAL_LIGHTS
             #pragma multi_compile_fragment _ _SHADOWS_SOFT
+            #pragma multi_compile _ _TERRAIN_LAYERS   // on = blend material layers; off = flat debug colors
 
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
@@ -59,6 +60,12 @@ Shader "Mesh Terrain/Channel Blend Shared Atlas (URP, BRG)"
                 float  _Metallic;
                 float4 _ChannelParams;   // (sliceBase, channelCount, texcoordMetric, _) — per-instance override
             CBUFFER_END
+
+            // Terrain layer params are GLOBAL (shared by all sections), set via Shader.SetGlobal*. Keeping them
+            // out of UnityPerMaterial avoids the BRG "var not declared in shader property section" error that
+            // cbuffer arrays trigger (arrays can't be BRG material properties). Globals are not per-material.
+            float4 _LayerParams[24]; // per-channel (tiling, normalStrength, heightContrast, _)
+            float  _LayerCount;
 
             // Per-instance _ChannelParams from the BRG instance buffer.
             #ifdef UNITY_DOTS_INSTANCING_ENABLED
@@ -79,6 +86,13 @@ Shader "Mesh Terrain/Channel Blend Shared Atlas (URP, BRG)"
                 if (channel == 6) return _ChannelColor6;
                 return _ChannelColor7;
             }
+
+            // Per-fragment slice context the layer-blend include reads via SAMPLE_CHANNEL_WEIGHT.
+            static int   _slBase;
+            static float2 _slChannelUV;
+            #define SAMPLE_CHANNEL_WEIGHT(c) \
+                saturate(SAMPLE_TEXTURE2D_ARRAY(_ChannelTex, sampler_ChannelTex, _slChannelUV, _slBase + (c)).r)
+            #include "MeshTerrainChannelBlend.hlsl"
 
             struct Attributes
             {
@@ -122,39 +136,57 @@ Shader "Mesh Terrain/Channel Blend Shared Atlas (URP, BRG)"
                 int sliceBase = (int)round(IN.sliceInfo.x);
                 int count = (int)round(IN.sliceInfo.y);
 
+                _slBase = sliceBase;
+                _slChannelUV = IN.channelUV;
+
+                float3 worldNormal = normalize(IN.normalWS);
                 float3 albedo = _BaseColor.rgb;
+                float roughness = 1.0 - _Smoothness;
+                float metallic = _Metallic;
+                float ao = 1.0;
+                float3 normalWS = worldNormal;
+
+            #ifdef _TERRAIN_LAYERS
+                // Blend per-channel material layers (albedo/normal/mask) by height-biased channel weight.
+                TerrainSurface ts = BlendTerrainLayers(IN.positionWS.xz, _BaseColor.rgb);
+                albedo = ts.albedo;
+                roughness = ts.roughness;
+                metallic = ts.metallic;
+                ao = ts.ao;
+
+                // Tangent basis for the terrain (mostly up-facing): tangent along world +X projected onto the
+                // surface, bitangent = N x T. Good enough for terrain; triplanar is a later upgrade.
+                float3 t = normalize(float3(1, 0, 0) - worldNormal * worldNormal.x);
+                float3 b = cross(worldNormal, t);
+                normalWS = normalize(t * ts.normalTS.x + b * ts.normalTS.y + worldNormal * ts.normalTS.z);
+            #else
+                // Flat debug-color blend (visualizer).
                 float totalWeight = 0;
                 float3 blended = 0;
-
                 [loop]
                 for (int c = 0; c < count && c < 24; c++)
                 {
-                    // Section channel c lives at shared-array slice (sliceBase + c).
-                    float w = SAMPLE_TEXTURE2D_ARRAY(_ChannelTex, sampler_ChannelTex, IN.channelUV, sliceBase + c).r;
-                    w = saturate(w);
+                    float w = saturate(SAMPLE_TEXTURE2D_ARRAY(_ChannelTex, sampler_ChannelTex, IN.channelUV, sliceBase + c).r);
                     blended += ChannelColor(c).rgb * w;
                     totalWeight += w;
                 }
-
                 totalWeight = saturate(totalWeight);
                 if (totalWeight > 1e-4)
-                {
-                    float3 channelColor = blended / max(totalWeight, 1e-4);
-                    albedo = lerp(_BaseColor.rgb, channelColor, totalWeight);
-                }
+                    albedo = lerp(_BaseColor.rgb, blended / max(totalWeight, 1e-4), totalWeight);
+            #endif
 
                 InputData lightingInput = (InputData)0;
                 lightingInput.positionWS = IN.positionWS;
-                lightingInput.normalWS = normalize(IN.normalWS);
+                lightingInput.normalWS = normalWS;
                 lightingInput.viewDirectionWS = GetWorldSpaceNormalizeViewDir(IN.positionWS);
                 lightingInput.shadowCoord = TransformWorldToShadowCoord(IN.positionWS);
-                lightingInput.bakedGI = max(SampleSH(lightingInput.normalWS), 0.15);
+                lightingInput.bakedGI = max(SampleSH(normalWS), 0.15);
 
                 SurfaceData surface = (SurfaceData)0;
                 surface.albedo = albedo;
-                surface.metallic = _Metallic;
-                surface.smoothness = _Smoothness;
-                surface.occlusion = 1.0;
+                surface.metallic = metallic;
+                surface.smoothness = 1.0 - roughness;
+                surface.occlusion = ao;
                 surface.alpha = 1.0;
 
                 return UniversalFragmentPBR(lightingInput, surface);
