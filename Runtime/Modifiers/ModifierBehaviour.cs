@@ -1,5 +1,6 @@
 using Unity.Mathematics;
 using UnityEngine;
+using Fca.MeshTerrain.Streaming;
 
 namespace Fca.MeshTerrain
 {
@@ -37,6 +38,14 @@ namespace Fca.MeshTerrain
 
         /// <summary>True if this modifier produces base geometry — sorted before all non-base modifiers.</summary>
         public abstract bool IsBaseModifier { get; }
+
+        /// <summary>
+        /// The weight channel name(s) this modifier writes, if any (e.g. a paint target). The streamer unions
+        /// these into the cook's global channel list so a written channel always gets a stable atlas slot —
+        /// without this, a channel absent from <c>Definition.ChannelNames</c> scatters across tiles. Returns
+        /// null/empty for modifiers that don't write channels.
+        /// </summary>
+        public virtual void GetWrittenChannels(System.Collections.Generic.List<string> outNames) { }
 
         /// <summary>
         /// Builds (or rebuilds) the plain core from this wrapper's serialized fields and transform.

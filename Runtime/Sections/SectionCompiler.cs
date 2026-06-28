@@ -420,7 +420,7 @@ namespace Fca.MeshTerrain
                 go.transform.SetParent(root, false);
                 go.AddComponent<MeshFilter>().sharedMesh = meshes[i];
                 var renderer = go.AddComponent<MeshRenderer>();
-                renderer.sharedMaterial = settings.Material;
+                renderer.sharedMaterial = settings.Material != null ? settings.Material : DefaultMaterial();
 
                 float height = i < heights.Length ? heights[i] : math.pow(0.5f, i + 1);
                 lods[i] = new LOD(math.clamp(height, 0.01f, 1f), new Renderer[] { renderer });
@@ -428,6 +428,26 @@ namespace Fca.MeshTerrain
 
             lodGroup.SetLODs(lods);
             lodGroup.RecalculateBounds();
+        }
+
+        // Fallback so a Definition with no Material set doesn't render as Unity's magenta error material.
+        // Assign Definition.Material to control the surface; this is only a visible-not-broken default.
+        static Material _defaultMaterial;
+        static bool _warnedNoMaterial;
+        static Material DefaultMaterial()
+        {
+            if (_defaultMaterial == null)
+            {
+                var shader = Shader.Find("Universal Render Pipeline/Lit") ?? Shader.Find("Standard");
+                _defaultMaterial = new Material(shader) { name = "MeshTerrain Default (no Definition.Material)" };
+            }
+            if (!_warnedNoMaterial)
+            {
+                _warnedNoMaterial = true;
+                UnityEngine.Debug.LogWarning("MeshTerrain: the MeshPartitionDefinition has no Material assigned — " +
+                    "using a default URP/Lit material. Assign Definition.Material to control the terrain surface.");
+            }
+            return _defaultMaterial;
         }
 
         static void PackWeightLayers(Mesh mesh, WeightLayerSet weights)

@@ -34,6 +34,11 @@ namespace Fca.MeshTerrain
 
         public override bool IsBaseModifier => false;
 
+        public override void GetWrittenChannels(System.Collections.Generic.List<string> outNames)
+        {
+            if (!string.IsNullOrEmpty(WeightChannelName)) outNames.Add(WeightChannelName);
+        }
+
         protected override ModifierComponent BuildCore(float4x4 gridToWorld)
         {
             return new WeightUtilityModifier

@@ -1,5 +1,6 @@
 using UnityEditor;
 using UnityEngine;
+using Fca.MeshTerrain.Streaming;
 
 namespace Fca.MeshTerrain.EditorTools
 {

@@ -286,6 +286,34 @@ namespace Fca.MeshTerrain.Streaming
                 w.MarkDirty(); // pick up any transform/field change since the last build
                 _stack.Add(w.GetCore(gridToWorld));
             }
+
+            RebuildChannelNames();
+        }
+
+        // Builds the global channel list = Definition.ChannelNames (declared order) unioned with the channels
+        // the scene modifiers write. Without this, a modifier writing a channel not declared in the Definition
+        // gets no stable global atlas slot, so the shared atlas scatters it across tiles (the cook normalizes to
+        // ChannelNames order — see SectionCooker.NormalizeToGlobalChannels). Cap at 24 (atlas slot budget).
+        readonly List<string> _channelNameScratch = new();
+        void RebuildChannelNames()
+        {
+            _channelNameScratch.Clear();
+            if (Definition != null && Definition.ChannelNames != null)
+                foreach (var n in Definition.ChannelNames)
+                    if (!string.IsNullOrEmpty(n) && !_channelNameScratch.Contains(n)) _channelNameScratch.Add(n);
+
+            foreach (var w in _sceneWrappers)
+            {
+                if (w == null) continue;
+                w.GetWrittenChannels(_channelNameScratch);
+            }
+            // De-dup (wrappers may repeat names) and clamp to the 24-channel atlas budget.
+            for (int i = _channelNameScratch.Count - 1; i >= 0; i--)
+                if (string.IsNullOrEmpty(_channelNameScratch[i]) || _channelNameScratch.IndexOf(_channelNameScratch[i]) != i)
+                    _channelNameScratch.RemoveAt(i);
+            if (_channelNameScratch.Count > 24) _channelNameScratch.RemoveRange(24, _channelNameScratch.Count - 24);
+
+            _channelOpts.ChannelNames = _channelNameScratch.Count > 0 ? _channelNameScratch.ToArray() : null;
         }
 
         void Update()
