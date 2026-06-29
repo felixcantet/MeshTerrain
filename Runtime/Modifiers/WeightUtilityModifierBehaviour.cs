@@ -29,8 +29,12 @@ namespace Fca.MeshTerrain
         public float InnerValue = 1f;
         [Tooltip("Weight applied beyond radius + falloff. UE OuterValue.")]
         public float OuterValue = 0f;
-        [Tooltip("Half-height of the affected box in Y (UE MaxZDistance, here MaxYDistance).")]
-        [Min(0f)] public float MaxYDistance = 1000f;
+        [Tooltip("Full height of the affected box in Y (UE MaxZDistance, here MaxYDistance). The paint is a 2D " +
+                 "XZ operation, so this must span the DISPLACED vertex range — modifiers run in order, so by the " +
+                 "time this paints, the base may already be pushed far in Y by noise. Too small and vertices on " +
+                 "tall features fall outside the view and stay unpainted (torn paint). Default is large; reduce " +
+                 "only to intentionally restrict painting to a Y band.")]
+        [Min(0f)] public float MaxYDistance = 100000f;
 
         public override bool IsBaseModifier => false;
 

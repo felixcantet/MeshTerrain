@@ -182,12 +182,23 @@ namespace Fca.MeshTerrain.Streaming
         void EditorTick()
         {
             if (Application.isPlaying || this == null) return;
+            // In edit mode the streaming focus is the SCENE-VIEW camera (what the user is looking at), not the
+            // play-mode Focus transform: residency, cook-cancellation, and finalize must all agree with the view.
+            // Using a Focus pointing at the Main Camera (often elsewhere) makes ShouldKeep reject finished cooks
+            // for tiles visible in the Scene view → they get treated as "cancelled" and never presented (holes).
             var sv = UnityEditor.SceneView.lastActiveSceneView;
-            Transform focus = Focus != null ? Focus : (sv != null && sv.camera != null ? sv.camera.transform : null);
+            Transform focus = (sv != null && sv.camera != null) ? sv.camera.transform : Focus;
             if (focus == null) return;
             Tick(focus.position);
-            // Repaint the Scene view so newly-presented BRG sections appear without a manual mouse move.
-            if (_pending.Count > 0 || _loadQueue.Count > 0) UnityEditor.SceneView.RepaintAll();
+            // While work is in flight, keep the editor actively ticking — EditorApplication.update is throttled
+            // when the editor is idle (no input / unfocused window), so FinalizeCompleted would stop being called
+            // with cooks still pending → permanently un-presented tiles (holes) until the next user action. Force
+            // continued updates + a scene repaint so every completed cook drains this and the following frames.
+            if (_pending.Count > 0 || _loadQueue.Count > 0)
+            {
+                UnityEditor.SceneView.RepaintAll();
+                UnityEditor.EditorApplication.QueuePlayerLoopUpdate(); // request another editor tick even when idle
+            }
         }
 #endif
 
@@ -332,8 +343,11 @@ namespace Fca.MeshTerrain.Streaming
         {
             if (!_initialized || _stack.Count == 0) return;
 
-            // Only re-resolve residency when the focus moved enough (or first frame).
-            if (!_hasLastFocus || math.distance(focusWorld, _lastFocus) >= RefocusThreshold)
+            // Re-resolve residency when the focus moved enough (or first frame), OR when nothing is in flight —
+            // the idle re-resolve is a cheap safety net that re-queues any desired cell that was evicted or had
+            // its cook cancelled (e.g. focus drift during a cook) and never re-queued, so holes can't persist.
+            bool idle = _pending.Count == 0 && _loadQueue.Count == 0;
+            if (!_hasLastFocus || math.distance(focusWorld, _lastFocus) >= RefocusThreshold || idle)
             {
                 ResolveResidency(focusWorld);
                 _lastFocus = focusWorld;
