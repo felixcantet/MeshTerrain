@@ -28,7 +28,11 @@ namespace Fca.MeshTerrain
             => new MeshSkirtSettings
             {
                 Enabled = true,
-                Width = math.max(cellSize * 0.01f, 0.1f),
+                // Width is the OUTWARD in-plane offset of the skirt ring (UE FMeshSkirtSettings::Width). It makes
+                // a tile's skirt overhang its neighbour's border, so the seam stays covered even when the two
+                // tiles' edges don't align (e.g. different LODs). Sized to ~one cell-edge sample so the overhang
+                // comfortably bridges a neighbour at a coarser LOD. UE ships a flat 10; we scale with the cell.
+                Width = math.max(cellSize * 0.1f, 1f),
                 PushDown = math.max(cellSize * 0.05f, 1f),
                 PushMethod = MeshSkirtPushMethod.FixedDown,
                 VertexSnapTolerance = 1e-4f,

@@ -77,11 +77,13 @@ namespace Fca.MeshTerrain.Streaming
         /// worker thread. The cooked mesh is unchanged (kept for collision); the render LODs live in
         /// <see cref="CookedSection.Lods"/>.
         ///
-        /// <para>Order matters: the skirt is applied <b>after</b> simplification, to each LOD's own simplified
-        /// border — NOT once before simplifying. Simplifying a pre-skirted mesh lets the decimator move/merge
-        /// the terrain↔skirt junction so the skirt peels away from the (now coarser) border on reduced LODs,
-        /// re-opening the seam (the "holes only fixed on LOD0" bug). Skirting each LOD anchors a fresh wall on
-        /// that LOD's actual edge, so seams stay covered at every level.</para></summary>
+        /// <para>Skirt geometry follows UE <c>AddMeshSkirt</c> (<c>MeshPartitionMeshSkirt.cpp</c>): each boundary
+        /// vertex is offset outward in-plane by <c>Width</c> AND pushed by <c>PushDown</c>, so the ring overhangs
+        /// the neighbour and covers the seam even when edges don't align. UE applies it <b>once before</b> the LOD
+        /// simplify; we apply it <b>per LOD after</b> simplify instead — strictly more robust, because simplifying
+        /// a pre-skirted mesh lets the decimator move the terrain↔skirt junction and peel the skirt off the
+        /// coarser border (the "holes only on reduced LODs" bug). Each LOD here gets a fresh skirt anchored on its
+        /// own simplified edge.</para></summary>
         static void BakeLods(CookedSection cooked, in LodCookOptions lod, Allocator allocator)
         {
             // Simplify the UNSKIRTED mesh into the LOD chain (LOD0 = copy; LODn = decimated).
