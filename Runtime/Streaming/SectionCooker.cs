@@ -73,31 +73,31 @@ namespace Fca.MeshTerrain.Streaming
             return cooked;
         }
 
-        /// <summary>Applies the skirt then bakes the simplified LOD chain (weights packed) on the worker
-        /// thread. The cooked mesh is unchanged (kept for collision); the render LODs live in
-        /// <see cref="CookedSection.Lods"/>.</summary>
+        /// <summary>Bakes the simplified LOD chain then applies the skirt <b>per LOD</b> (weights packed) on the
+        /// worker thread. The cooked mesh is unchanged (kept for collision); the render LODs live in
+        /// <see cref="CookedSection.Lods"/>.
+        ///
+        /// <para>Order matters: the skirt is applied <b>after</b> simplification, to each LOD's own simplified
+        /// border — NOT once before simplifying. Simplifying a pre-skirted mesh lets the decimator move/merge
+        /// the terrain↔skirt junction so the skirt peels away from the (now coarser) border on reduced LODs,
+        /// re-opening the seam (the "holes only fixed on LOD0" bug). Skirting each LOD anchors a fresh wall on
+        /// that LOD's actual edge, so seams stay covered at every level.</para></summary>
         static void BakeLods(CookedSection cooked, in LodCookOptions lod, Allocator allocator)
         {
-            MeshData renderBase = cooked.Mesh;
-            WeightLayerSet renderWeights = cooked.Weights;
-            MeshData skirted = default;
-            WeightLayerSet skirtWeights = null;
-            bool builtSkirt = false;
+            // Simplify the UNSKIRTED mesh into the LOD chain (LOD0 = copy; LODn = decimated).
+            cooked.Lods = SectionLODBaker.Bake(cooked.Mesh, cooked.Weights, lod.Qualities, allocator);
 
+            // Apply a fresh skirt to each LOD's own border, replacing the bare LOD with its skirted version.
             if (lod.Skirt.Enabled)
             {
-                skirted = SectionCompiler.BuildSkirt(cooked.Mesh, cooked.Weights, lod.Skirt, allocator, out skirtWeights);
-                renderBase = skirted;
-                renderWeights = skirtWeights;
-                builtSkirt = true;
-            }
-
-            cooked.Lods = SectionLODBaker.Bake(renderBase, renderWeights, lod.Qualities, allocator);
-
-            if (builtSkirt)
-            {
-                skirted.Dispose();
-                skirtWeights?.Dispose();
+                for (int i = 0; i < cooked.Lods.Length; i++)
+                {
+                    var bare = cooked.Lods[i];
+                    MeshData skirted = SectionCompiler.BuildSkirt(bare.Mesh, bare.Weights, lod.Skirt, allocator, out var sw);
+                    bare.Mesh.Dispose();
+                    bare.Weights?.Dispose();
+                    cooked.Lods[i] = new LodMesh { Mesh = skirted, Weights = sw };
+                }
             }
 
             // Collision: baked from the UNSKIRTED cooked mesh (no skirt walls in contact), simplified to a
