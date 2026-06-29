@@ -317,6 +317,10 @@ namespace Fca.MeshTerrain.Streaming
                 return new JobHandle();
             }
 
+            // Flush any pending shared-atlas slice writes once per frame (idempotent across the multiple cull
+            // views — camera/shadow/picking — so the costly Texture.Apply runs at most once, not per section).
+            _atlas?.Flush();
+
             // Camera position for distance-based LOD + frustum planes for culling.
             float3 camPos = cullingContext.lodParameters.cameraPosition;
             var planes = cullingContext.cullingPlanes; // NativeArray<Plane>

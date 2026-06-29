@@ -92,6 +92,20 @@ namespace Fca.MeshTerrain.Streaming
                 int n = math.min(sliceBytes, blob.Length - srcOffset);
                 for (int i = 0; i < n; i++) data[i] = blob[srcOffset + i];
             }
+            // Defer the GPU upload: Texture.Apply re-uploads the ENTIRE array (Capacity slices) and (with
+            // mipmaps) regenerates all mips — far too costly to run once per presented section. Mark dirty and
+            // let the presenter Flush() once per frame so a burst of presents costs a single upload.
+            _dirty = true;
+        }
+
+        bool _dirty;
+
+        /// <summary>Uploads pending slice writes to the GPU once. Call at most once per frame (e.g. before the
+        /// BRG cull/draw) so many per-section writes batch into a single Texture.Apply.</summary>
+        public void Flush()
+        {
+            if (!_dirty) return;
+            _dirty = false;
             Texture.Apply(updateMipmaps: true);
         }
 
