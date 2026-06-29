@@ -51,6 +51,12 @@ namespace Fca.MeshTerrain.Streaming
         [Tooltip("Re-evaluate the desired set only when the focus moves at least this far (world units).")]
         public float RefocusThreshold = 25f;
 
+        [Header("Skirt")]
+        [Tooltip("Vertical skirt depth (world units) baked at section borders to hide inter-tile seams. " +
+                 "Must exceed the worst height difference between neighbouring tile edges (caused by LOD " +
+                 "differences + displacement). 0 = auto-derive from cell size + the stack's noise amplitude.")]
+        public float SkirtPushDown = 0f;
+
         [Header("Channels")]
         public bool GenerateChannels = true;
         [Tooltip("Force a fixed channel-atlas resolution (>0) so all section atlases fit one shared " +
@@ -173,7 +179,7 @@ namespace Fca.MeshTerrain.Streaming
             _sceneWrappers.Clear();
             if (stack != null) _stack.AddRange(stack);
             _codeStackOverride = true; // a code stack wins over scene collection until cleared
-            if (_initialized) ForceUnloadAll();
+            if (_initialized) { ResolveSkirt(); ForceUnloadAll(); }
         }
 
         /// <summary>Overrides the default <see cref="GameObjectSectionPresenter"/> (e.g. for tests).</summary>
@@ -370,6 +376,33 @@ namespace Fca.MeshTerrain.Streaming
             }
 
             RebuildChannelNames();
+            ResolveSkirt();
+        }
+
+        // Sizes the baked skirt deep enough to hide inter-tile seams. Neighbouring tiles can differ in LOD, so a
+        // shared edge's vertices don't line up and a gap appears under displacement; the skirt is a vertical wall
+        // dropped at each border to cover that gap. PushDown must therefore exceed the worst inter-tile height
+        // difference ≈ the stack's peak noise amplitude. SkirtPushDown > 0 overrides; 0 = auto (cellSize floor +
+        // ~1.5x summed noise Intensity). Changing this re-keys sections (VariantHash) → re-cook.
+        void ResolveSkirt()
+        {
+            float depth;
+            if (SkirtPushDown > 0f)
+            {
+                depth = SkirtPushDown;
+            }
+            else
+            {
+                float noiseAmplitude = 0f;
+                foreach (var m in _stack)
+                    if (m is NoiseModifier n) noiseAmplitude += (float)math.abs(n.Intensity);
+                float floor = math.max(_grid.CellSize * 0.05f, 1f);
+                depth = math.max(floor, noiseAmplitude * 1.5f);
+            }
+
+            var skirt = _compileSettings.Skirt;
+            skirt.PushDown = depth;
+            _lodOptions.Skirt = skirt;
         }
 
         // Builds the global channel list = Definition.ChannelNames (declared order) unioned with the channels
