@@ -67,6 +67,33 @@ namespace Fca.MeshTerrain.Streaming
                  "authoring). When off, the stack is supplied in code via SetModifierStack (tests/demo).")]
         public bool UseSceneModifiers = true;
 
+        /// <summary>Which presenter renders the streamed sections.</summary>
+        public enum PresenterBackend
+        {
+            /// <summary>One GameObject hierarchy per section (MeshRenderer/LODGroup/MeshCollider). Simple, but
+            /// per-tile main-thread cost (upload + AddComponent + PhysX) caps the scale.</summary>
+            GameObject,
+            /// <summary>GPU-instanced via BatchRendererGroup + shared channel atlas. Scales to large worlds
+            /// (draws stop scaling with section count); requires a fixed atlas resolution.</summary>
+            BatchRendererGroup,
+        }
+
+        [Header("Presenter")]
+        [Tooltip("GameObject = one renderer hierarchy per section (simple). BatchRendererGroup = GPU-instanced, " +
+                 "shared-atlas, scales to large worlds (needs Fixed Atlas Resolution > 0).")]
+        public PresenterBackend Presenter = PresenterBackend.GameObject;
+        [Tooltip("Material for the BRG presenter. Use a 'Mesh Terrain/...(BRG)' instanced shader. " +
+                 "Null falls back to the instanced flat shader.")]
+        public Material InstancedMaterial;
+        [Tooltip("Max sections the BRG shared atlas can hold (Texture2DArray slice budget / capacity).")]
+        public int BrgAtlasCapacity = 1024;
+        [Tooltip("Per-channel terrain-layer array resolution for the BRG shared layer atlas.")]
+        public int LayerArrayResolution = 512;
+        [Tooltip("BRG: tint sections by LOD for debugging.")]
+        public bool DebugLodColors = false;
+        [Tooltip("BRG: force every section to LOD0 (disables GPU LOD selection).")]
+        public bool BrgForceLod0 = false;
+
         // --- runtime state ---
         GridSettings _grid;
         GridDimensions _dims;
@@ -150,7 +177,13 @@ namespace Fca.MeshTerrain.Streaming
         }
 
         /// <summary>Overrides the default <see cref="GameObjectSectionPresenter"/> (e.g. for tests).</summary>
-        public void SetPresenter(ISectionPresenter presenter) => _presenter = presenter;
+        public void SetPresenter(ISectionPresenter presenter)
+        {
+            _presenter = presenter;
+            _ownsPresenter = false; // injected: the caller owns disposal (demo/tests)
+        }
+        // True only when the streamer built _presenter itself (CreatePresenter) and must dispose it on teardown.
+        bool _ownsPresenter;
 
         void OnEnable()
         {
@@ -247,7 +280,12 @@ namespace Fca.MeshTerrain.Streaming
             string dir = string.IsNullOrEmpty(CacheDirOverride) ? null : CacheDirOverride;
             _cache = new SectionCache(id, RamCapacity, dir, Allocator.Persistent);
 
-            _presenter ??= new GameObjectSectionPresenter(_compileSettings);
+            // Build the configured presenter unless one was injected (tests/demo via SetPresenter).
+            if (_presenter == null)
+            {
+                _presenter = CreatePresenter();
+                _ownsPresenter = true;
+            }
 
             _initialized = true;
             _hasLastFocus = false;
@@ -255,6 +293,39 @@ namespace Fca.MeshTerrain.Streaming
             // Assemble the stack from scene wrappers unless a code stack was supplied (tests/demo).
             if (UseSceneModifiers && !_codeStackOverride)
                 CollectSceneModifiers();
+        }
+
+        // Builds the presenter selected by Presenter. The BRG path needs a fixed atlas resolution (the shared
+        // Texture2DArray requires every section atlas to be the same size) and wires the terrain layers + editor
+        // picking exactly as the demo does.
+        ISectionPresenter CreatePresenter()
+        {
+            if (Presenter == PresenterBackend.BatchRendererGroup)
+            {
+                int atlasRes = GenerateChannels ? FixedAtlasResolution : 0;
+                if (GenerateChannels && atlasRes <= 0)
+                {
+                    atlasRes = 256;
+                    Debug.LogWarning("MeshTerrainStreamer: the BatchRendererGroup presenter needs a fixed atlas " +
+                        "resolution (the shared atlas requires equal-size section atlases). Set Fixed Atlas " +
+                        $"Resolution > 0; defaulting to {atlasRes}.");
+                    _channelOpts.FixedResolution = atlasRes; // keep the cook in sync with the shared atlas size
+                }
+
+                float[] lodHeights = _compileSettings != null ? _compileSettings.LODScreenRelativeTransitionHeights : null;
+                var brg = new BatchRendererGroupSectionPresenter(
+                    InstancedMaterial, transform, lodHeights, atlasRes, math.max(1, BrgAtlasCapacity))
+                {
+                    DebugLodColors = DebugLodColors,
+                    ForceLod0 = BrgForceLod0,
+                };
+                if (Definition != null && Definition.ChannelLayers != null && Definition.ChannelLayers.Count > 0)
+                    brg.SetTerrainLayers(Definition.ChannelLayers, LayerArrayResolution);
+                brg.SetPickingObject(this); // editor click/box-select selects this streamer via its sections
+                return brg;
+            }
+
+            return new GameObjectSectionPresenter(_compileSettings);
         }
 
         /// <summary>
@@ -703,6 +774,12 @@ namespace Fca.MeshTerrain.Streaming
             ForceUnloadAll();
             _cache?.Dispose();
             _cache = null;
+            // Dispose the presenter only if WE built it (BRG owns a native BatchRendererGroup + GraphicsBuffers
+            // that must be released before a domain reload). An injected presenter (demo/tests) is the caller's.
+            if (_ownsPresenter && _presenter is System.IDisposable disposable)
+                disposable.Dispose();
+            if (_ownsPresenter) _presenter = null;
+            _ownsPresenter = false;
             _initialized = false;
         }
 
